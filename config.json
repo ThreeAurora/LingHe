@@ -1,0 +1,16 @@
+{
+  "ai": {
+    "mode": "auto",
+    "local_urls": ["http://localhost:11434", "http://localhost:1234"],
+    "api_base": "",
+    "api_key": "",
+    "model": "qwen2.5:1.5b",
+    "timeout": 1.8,
+    "max_candidates": 8,
+    "temperature": 0.2
+  },
+  "mabiao_dir": "mabiao",
+  "max_buffer_len": 12,
+  "candidate_count": 9,
+  "context_max": 120
+}
