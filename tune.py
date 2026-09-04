@@ -44,7 +44,9 @@ CASES = [
 def make_rr():
     de = DictEngine(log=lambda *a: None)
     de.load_dir(os.path.join(BASE, "dicts"))
-    return rerank.StatReranker(de, log=lambda *a: None), de
+    rr = rerank.StatReranker(de, log=lambda *a: None)
+    rr.load(os.path.join(BASE, "dicts"))  # 用户表+预训练共现表都要加载
+    return rr, de
 
 
 def score(rr, topn=1):
