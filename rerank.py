@@ -42,7 +42,10 @@ A = 1.0      # unigram 词频权重
 L = 12.0     # 长词奖励（每多一个字减多少代价）
 P = 4.0      # 单字惩罚
 U = 3.0      # 用户个性化权重
-B = 4.0      # 上下文 bigram 权重
+B = 4.0      # 上下文 bigram 权重（用户在线学习）
+B_PRE = 1.5    # 预训练词级共现权重（弱于用户证据，只做平票裁决，与用户取 max 不叠加）
+B_PRE_CHAR = 0.0  # 预训练字级共现：实测弊大于利（中性字对太多无区分度，10 例 9→8），默认禁用；
+                  # 表仍在 cooc_pre.bin 里，如需启用调成 0.8~1.2
 UNK_LOG = 1.4  # 未登录词（底库无词频）的默认 log 频
 
 BEAM = 6        # Viterbi beam 宽度
@@ -55,17 +58,21 @@ class StatReranker:
     def __init__(self, dict_engine, log=print):
         self.de = dict_engine
         self.log = log
-        self.bigram = {}          # (prev_word, word) -> count
+        self.bigram = {}          # (prev_word, word) -> count，用户在线学习
+        self.pre_word = {}        # 预训练词级共现（SIGHAN 语料统计，见 build_cooc.py）
+        self.pre_char = {}        # 预训练字级共现（跨词边界尾字→首字）
+        self._next_user = None    # 后继倒排（联想用），load/learn 时懒建
+        self._next_pre = None
         self._path = None
         self._dirty = 0
         self._lock = threading.Lock()
         self._viterbi_cache = {}
         self._cache_ver = 0       # bigram 变化时自增，作废旧缓存
 
-    # ---------- 持久化：用户 bigram ----------
+    # ---------- 持久化：用户 bigram + 预训练共现 ----------
 
     def load(self, dir_path):
-        """加载用户二元共现表（dicts/user_bigram.txt）。"""
+        """加载用户二元表与预训练共现表（后者由 build_cooc.py 生成，可缺省）。"""
         self._path = os.path.join(dir_path, "user_bigram.txt")
         n = 0
         try:
@@ -82,10 +89,27 @@ class StatReranker:
             pass
         if n:
             self.log("[共现] 载入 %d 条用户二元关系" % n)
+        pre_path = os.path.join(dir_path, "cooc_pre.bin")
+        try:
+            import marshal
+            with open(pre_path, "rb") as f:
+                pre = marshal.load(f)
+            if "word" in pre:  # 新格式：{"word": {...}, "char": {...}}
+                self.pre_word = pre["word"]
+                self.pre_char = pre["char"]
+            else:              # 旧格式：单层词级 dict
+                self.pre_word = pre
+                self.pre_char = {}
+            self.log("[共现] 预训练表 词%d 字%d（SIGHAN 语料）"
+                     % (len(self.pre_word), len(self.pre_char)))
+        except (OSError, ValueError):
+            self.pre_word = {}
+            self.pre_char = {}
+        self._build_next_index()
         return n
 
     def flush(self):
-        """把 bigram 表写回磁盘（退出时调用）。"""
+        """把 bigram 表写回磁盘（退出时调用）。只写用户表——预训练表是只读的。"""
         with self._lock:
             if not self._dirty or not self._path:
                 return
@@ -108,6 +132,42 @@ class StatReranker:
             self.bigram[k] = self.bigram.get(k, 0) + 1
             self._dirty += 1
             self._cache_ver += 1
+            self._next_user.setdefault(prev_word, []).append(word)
+
+    def _build_next_index(self):
+        """后继倒排索引：联想查询要按上词取 top 后继，倒排后 O(后继数)。"""
+        self._next_pre = {}
+        for (a, b) in self.pre_word:
+            self._next_pre.setdefault(a, []).append(b)
+        self._next_user = {}
+        for (a, b) in self.bigram:
+            self._next_user.setdefault(a, []).append(b)
+
+    def next_word(self, prev, n=1):
+        """联想 prev 的下一个词（豆包式上屏联想）。
+
+        用户表与预训练词级表取强者；只返回底库存在的词（不推生僻人名等）。
+        返回 top n 词列表（可为空）。
+        """
+        if not prev:
+            return []
+        if self._next_pre is None:
+            self._build_next_index()
+        cand = {}
+        for b in self._next_user.get(prev, ()):
+            c = self.bigram.get((prev, b), 0)
+            if b in self.de.word_py:
+                cand[b] = max(cand.get(b, 0.0), B * math.log(1 + c))
+        for b in self._next_pre.get(prev, ()):
+            if b in cand:
+                continue
+            c = self.pre_word.get((prev, b), 0)
+            if b in self.de.word_py and c:
+                cand[b] = max(cand.get(b, 0.0), B_PRE * math.log(1 + c))
+        if not cand:
+            return []
+        ranked = sorted(cand.items(), key=lambda kv: -kv[1])
+        return [w for w, _ in ranked[:n]]
 
     # ---------- 打分 ----------
 
@@ -126,11 +186,28 @@ class StatReranker:
         return c
 
     def _bi_bonus(self, prev, word):
-        """上文 bigram 加分（在线学习得来）。"""
+        """上文加分：用户在线学习（B）、预训练词级（B_PRE）、预训练字级（B_PRE_CHAR）
+        三者取强者，不叠加。
+
+        不叠加的原因：预训练语料规模与用户使用量差若干个数量级，线性相加会让
+        预训练永久淹没用户证据；取 max 则用户打过一次的词立刻以更高权重生效。
+        字级（prev 尾字 × word 首字）是词级未覆盖时的泛化兜底。
+        """
         if not prev:
             return 0.0
+        bonus = 0.0
         c = self.bigram.get((prev, word), 0)
-        return B * math.log(1 + c) if c else 0.0
+        if c:
+            bonus = B * math.log(1 + c)
+        if self.pre_word:
+            c2 = self.pre_word.get((prev, word), 0)
+            if c2:
+                bonus = max(bonus, B_PRE * math.log(1 + c2))
+        if self.pre_char:
+            c3 = self.pre_char.get((prev[-1], word[0]), 0)
+            if c3:
+                bonus = max(bonus, B_PRE_CHAR * math.log(1 + c3))
+        return bonus
 
     def rerank(self, cands, prev_word=None):
         """对底库候选按 (unigram + 上文 + 用户习惯) 重排。

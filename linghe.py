@@ -203,6 +203,7 @@ class Engine:
         self._cache_code = None      # compute 结果缓存（同码串复用）
         self._cache_cands = None
         self._cache_nmb = 0
+        self.liaison = None          # 上屏联想词（豆包式：上屏后提示下一词，空格直上）
 
         self.ai = AIEngine(cfg.get("ai", {}), log=log)
         self.ai.on_result = lambda seq: self.q.put(("ai", seq))
@@ -361,6 +362,8 @@ class Engine:
                         send_unicode(raw)
                     else:
                         self.cn_mode = not self.cn_mode
+                        self.liaison = None
+                        self.q.put(("hide",))
                         self.q.put(("flash", "[中]" if self.cn_mode else "[EN]"))
                         self.log("[模式] " + ("中文" if self.cn_mode else "英文"))
             return user32.CallNextHookEx(None, ncode, wparam, lparam)  # Shift 永远放行
@@ -391,9 +394,17 @@ class Engine:
         if fg != self.last_fg:
             self.last_fg = fg
             self.context.clear()  # 换窗口=换语境
+            self.liaison = None
+            self.q.put(("hide",))
 
         if not self.cn_mode:  # 英文态：全部透传
             return user32.CallNextHookEx(None, ncode, wparam, lparam)
+
+        # 联想词生命周期：只被空格消费，其他任何键都取消
+        if self.liaison and vk != VK_SPACE:
+            self.liaison = None
+            if not self.buffer:
+                self.q.put(("hide",))
 
         if is_letter:
             if key_down(VK_SHIFT):  # 大写意图：放弃组码，透传
@@ -422,6 +433,13 @@ class Engine:
                 else:
                     self.buffer = ""
                     self.q.put(("hide",))
+                return self._eat()
+            if self.liaison:  # 联想态：空格直接上屏联想词（并继续联想下一词）
+                w = self.liaison
+                self.liaison = None
+                if self.de.loaded:
+                    self.de.remember(w, self.de.word_py.get(w, ""))  # 联想上屏也调频
+                self._commit(w)
                 return self._eat()
             return user32.CallNextHookEx(None, ncode, wparam, lparam)
 
@@ -517,6 +535,13 @@ class Engine:
         if py:
             self.de.remember(word, py)  # 新词入库/旧词调频，批量落盘
         send_unicode(word)  # 注入事件自带 INJECTED 标志，会被钩子放行
+        # 上屏联想（豆包式）：提示下一个可能的词，空格直接上屏
+        self.liaison = None
+        if self.cfg.get("liaison", True):
+            nxt = self.rr.next_word(word, 1)
+            if nxt:
+                self.liaison = nxt[0]
+                self.q.put(("liaison", word, self.liaison, caret_pos()))
 
     # ---- 安装/卸载 ----
     def install_hook(self):
@@ -587,6 +612,11 @@ def main():
                     _, text, = item[0], item[1]
                     ui.flash(text, last_pos)
                     root.after(900, ui.hide)
+                elif kind == "liaison":
+                    # 上屏联想：候选窗显示 [已上屏词 + 联想词]，空格即上屏联想词
+                    _, prev, nxt, pos = item
+                    last_pos = pos
+                    ui.update(prev, [(nxt, True)], pos)
                 elif kind == "ai":
                     # AI 结果返回：失效缓存后重算（把 AI 候选并入），按当前页显示
                     if eng.buffer:
