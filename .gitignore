@@ -3,3 +3,6 @@ __pycache__/
 
 # 底库二进制缓存（可由文本词库再生，且会随词频更新频繁变化）
 dicts/.cache.bin
+
+# OpenSubtitles 下载残页（404 响应体，无价值）
+cache/tmp/corpus/opensub_raw.zip
