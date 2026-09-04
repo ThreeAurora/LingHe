@@ -48,14 +48,15 @@ LLKHF_INJECTED = 0x10
 VK_BACK, VK_ESCAPE, VK_SPACE, VK_RETURN = 0x08, 0x1B, 0x20, 0x0D
 VK_SHIFT, VK_CONTROL, VK_MENU = 0x10, 0x11, 0x12
 VK_LWIN, VK_RWIN = 0x5B, 0x5C
+VK_TAB = 0x09
 VK_L = 0x4C
 VK_OEM_1 = 0xBA    # ; :
 VK_OEM_7 = 0xDE    # ' "
+VK_OEM_MINUS = 0xBD  # - _（上一页）
+VK_OEM_PLUS = 0xBB   # = +（下一页）
 
 PUNCT_VKS = {
-    0xBB,  # = +
     0xBC,  # , <
-    0xBD,  # - _
     0xBE,  # . >
     0xBF,  # / ?
     0xC0,  # ` ~
@@ -192,9 +193,23 @@ class Engine:
         ddir = os.path.join(base_dir, "dicts")
         self.de.load_dir_async(ddir, on_done=self._on_dict_ready)
 
+        # 端侧统计重排器（豆包第二层）：只重排底库候选，码表固频不参与
+        self.rr = StatReranker(self.de, log=log)
+        self.rr.load(ddir)
+        self.last_word = ""          # 上一个上屏词（bigram 学习与重排的上文）
+        self.page = 0                # 候选翻页（-/=/Tab）
+        self.n_pool = int(cfg.get("candidate_pool", 45))
+        self._cache_code = None      # compute 结果缓存（同码串复用）
+        self._cache_cands = None
+        self._cache_nmb = 0
+
         self.ai = AIEngine(cfg.get("ai", {}), log=log)
         self.ai.on_result = lambda seq: self.q.put(("ai", seq))
-        self.ai.probe()
+        if cfg.get("ai", {}).get("enabled", True):
+            self.ai.probe()
+        else:
+            self.ai.ready = False
+            log("[AI] 已按配置停用（ai.enabled=false），纯静态模式")
 
         self.buffer = ""
         self.enabled = True
@@ -210,13 +225,15 @@ class Engine:
 
     def _on_dict_ready(self, ok):
         if ok:
+            self._cache_code = None  # 底库上线，作废旧候选
             self.q.put(("flash", "[底库就绪 %d词]" % self.de.size))
             self.log("[底库] 后台加载完成：%d 词条" % self.de.size)
 
     # ---- 候选组装：排序公式的唯一实现 ----
     def _fused_candidates(self, code):
         """辅码筛选词（最高优先）：多假设解析出 音节+辅码 解释，
-        查码表词后校验辅码（mid=第 idx 字，word=-1 任意字），通过者按固频序。"""
+        查码表+底库词后校验辅码（idx=第几字，-1=任意字），通过者按固频序。
+        辅码作用于**所有词**（主人明确要求）：不止码表，152 万底库词同样可筛。"""
         if not self.fm.loaded or len(code) < 3:
             return []
         out, seen = [], set()
@@ -224,9 +241,11 @@ class Engine:
             if not fuses or len(syls) < 2:
                 continue
             ss = "".join(syls)
-            if len(ss) > 4:
-                continue  # 词最长 4 码
-            for w in self.mb.exact(ss):
+            cands = list(self.mb.exact(ss)) if len(ss) <= 4 else []
+            if self.de.loaded and len(syls) <= 4:
+                # 底库同拼音词一并进入辅码筛选池
+                cands += self.de.lookup_pinyin(" ".join(syls), 30)
+            for w in cands:
                 if len(w) != len(syls) or w in seen:
                     continue
                 ok = True
@@ -242,44 +261,65 @@ class Engine:
                 if ok:
                     out.append(w)
                     seen.add(w)
-            if len(out) >= self.n_show:
+            if len(out) >= self.n_pool:
                 break
         return out
 
     def compute(self, code):
-        # 第 1 优先：辅码筛选出的词（打了辅码 = 用户在钉死这个词）
+        """候选装配（返回候选池，供翻页）：
+        辅码筛选 → 码表(固频) → 底库词(动态调频:重排) → 整句切分 → AI 顺延。
+        主码表是固频永不重排（主人约定）；底库是动态调频侧。
+        同码串连续调用直接命中缓存（翻页/选字/AI 回包都不再重算）。"""
+        if code == self._cache_code and self._cache_cands is not None:
+            return self._cache_cands, self._cache_nmb
+        n = len(code)
         fused = self._fused_candidates(code)
-        # 第 2 优先：码表侧（精确码 + 前缀命中，固频序）
-        mb_hits = list(self.mb.exact(code))
-        seen = set(fused) | set(mb_hits)
-        for w in self.mb.prefix(code, self.n_show * 3):
+        mb_exact = list(self.mb.exact(code))
+        seen = set(fused) | set(mb_exact)
+        mb_hits = fused + mb_exact
+        for w in self.mb.prefix(code, self.n_pool * 2):
             if w not in seen:
                 mb_hits.append(w)
                 seen.add(w)
-        base = fused + mb_hits
-        # 第 3 优先：底库（152 万词，后台就绪后生效）——码表没有的词在这里出，
-        # 如 6 码 vhmusi -> "zhan mu si" -> 詹姆斯；奇数长（第5码起续码中）用简拼兜
-        n = len(code)
-        if self.de.loaded and len(base) < self.n_show:
+        # 底库（动态调频侧）：先词后句。词进统计重排；整句切分单独一层跟在词后。
+        dict_words, sentences = [], []
+        if self.de.loaded:
             if n >= 2 and n % 2 == 0:
                 py = " ".join(decode_syllable(code[i:i + 2]) for i in range(0, n, 2))
-                for w in self.de.lookup_pinyin(py, self.n_show):
-                    if w not in seen:
-                        base.append(w)
-                        seen.add(w)
-            if len(base) < self.n_show and n >= 3 and not self.mb.exact(code) and not self.mb.prefix(code, 1):
-                for w in self.de.lookup_initial(" ".join(code), self.n_show):
-                    if w not in seen:
-                        base.append(w)
-                        seen.add(w)
-        base = base[: self.n_show]
-        n_mb = len(base)
-        # AI 顺延：静态引擎命中 k 个，AI 从第 k+1 位起
+                dict_words += self.de.lookup_pinyin(py, self.n_pool)
+            if n >= 3 and not mb_exact and not self.mb.prefix(code, 1):
+                dict_words += self.de.lookup_initial(" ".join(code), self.n_pool)
+            dw = []
+            for w in dict_words:  # 池内去重（全拼路/简拼路可能命中同一个词）
+                if w not in seen:
+                    seen.add(w)
+                    dw.append(w)
+            dict_words = self.rr.rerank(dw, self.last_word)
+            if n > 4:
+                # 第 5 码起整句切分：全拼/简拼两路并跑，按「每字平均代价」合并——
+                # 两路代价不可直接比较（词数不同），每字均值语义一致。
+                pool = []
+                if n % 2 == 0:
+                    keys = [decode_syllable(code[i:i + 2]) for i in range(0, n, 2)]
+                    pool += self.rr.viterbi(keys, "py", 5, ret_cost=True)
+                pool += self.rr.viterbi(list(code), "ini", 5, ret_cost=True)
+                pool.sort(key=lambda t: t[1] / max(1, t[2]))
+                for s, _c, _m in pool:
+                    if s not in seen and s not in sentences:
+                        sentences.append(s)
+        base = mb_hits + dict_words + sentences
+        base = base[: self.n_pool]
+        n_mb = len(mb_hits)
+        # AI 顺延：静态侧命中 k 个，AI 从第 k+1 位起
         merged = base[:]
         for w in self.ai.peek(self.context_key(), code):
             if w not in merged:
                 merged.append(w)
-        return merged[: self.n_show], n_mb
+        merged = merged[: self.n_pool]
+        self._cache_code = code
+        self._cache_cands = merged
+        self._cache_nmb = n_mb
+        return merged, n_mb
 
     def context_key(self):
         return "".join(self.context)[-32:]
@@ -302,7 +342,7 @@ class Engine:
         if info.flags & LLKHF_INJECTED:
             return user32.CallNextHookEx(None, ncode, wparam, lparam)  # 自己注入的，放行
 
-        # Shift 单击 = 中英切换（按下后 400ms 内无其他键、抬起时触发）
+        # Shift 单击：组码中=上屏已敲的英文（搜狗/微软惯例）；空码=中英切换
         if vk == VK_SHIFT:
             if msg in (WM_KEYDOWN, WM_SYSKEYDOWN):
                 self.shift_t0 = kernel32.GetTickCount64()
@@ -310,11 +350,17 @@ class Engine:
             elif msg == WM_KEYUP and self.shift_alone:
                 self.shift_alone = False
                 if self.enabled and kernel32.GetTickCount64() - self.shift_t0 <= 400:
-                    self.cn_mode = not self.cn_mode
-                    self.buffer = ""
-                    self.q.put(("hide",))
-                    self.q.put(("flash", "[中]" if self.cn_mode else "[EN]"))
-                    self.log("[模式] " + ("中文" if self.cn_mode else "英文"))
+                    if self.buffer:
+                        raw = self.buffer
+                        self.buffer = ""
+                        self.page = 0
+                        self.q.put(("hide",))
+                        self.stats["commits"] += 1
+                        send_unicode(raw)
+                    else:
+                        self.cn_mode = not self.cn_mode
+                        self.q.put(("flash", "[中]" if self.cn_mode else "[EN]"))
+                        self.log("[模式] " + ("中文" if self.cn_mode else "英文"))
             return user32.CallNextHookEx(None, ncode, wparam, lparam)  # Shift 永远放行
         if msg in (WM_KEYDOWN, WM_SYSKEYDOWN):
             self.shift_alone = False  # 期间按了别的键 → 不是单击
@@ -380,14 +426,26 @@ class Engine:
         if is_digit and self.buffer:
             idx = vk - 0x31
             cands, _ = self.compute(self.buffer)
+            idx += self.page * self.n_show  # 数字选字作用于当前页
             if idx < len(cands):
                 self._commit(cands[idx])
             return self._eat()
 
+        # 翻页：=/Tab 下一页（末页回卷），- 上一页；无组码时透传
+        if self.buffer and vk in (VK_OEM_PLUS, VK_OEM_MINUS, VK_TAB):
+            cands, _ = self.compute(self.buffer)
+            n_pages = max(1, (len(cands) + self.n_show - 1) // self.n_show)
+            if vk == VK_OEM_MINUS:
+                self.page = max(0, self.page - 1)
+            else:
+                self.page = 0 if self.page + 1 >= n_pages else self.page + 1
+            return self._eat()
+
         if vk in (VK_OEM_1, VK_OEM_7) and self.buffer:
-            # 分号=2选，单引号=3选（音形重码选择键惯例）
+            # 分号=2选，单引号=3选（音形重码选择键惯例，作用于当前页）
             idx = 1 if vk == VK_OEM_1 else 2
             cands, _ = self.compute(self.buffer)
+            idx += self.page * self.n_show
             if len(cands) > idx:
                 self._commit(cands[idx])
             return self._eat()  # 无对应候选时吞键忽略，;/' 不漏进目标窗口
@@ -422,6 +480,7 @@ class Engine:
         return 1  # 吞掉，不让原始键进入目标应用
 
     def _after_edit(self):
+        self.page = 0  # 组码内容变化 → 回第一页
         if not self.buffer:
             self.q.put(("hide",))
             return
@@ -430,9 +489,11 @@ class Engine:
         if cands:
             self.q.put(("show", self.buffer, cands, n_mb, pos))
         else:
-            self.q.put(("think", self.buffer, pos))  # 码表零命中且 AI 在途
-        if not n_mb or len(cands) < self.n_show or len(self.buffer) > 4:
-            # 长码（第5码起纯双拼续词）主要靠 AI 出长词
+            self.q.put(("think", self.buffer, pos))  # 静态零命中，AI 在途
+        # AI 只在长码（第 5 码起）时补位：短码静态侧（码表+底库+重排）已足够强，
+        # 生成式 LLM 也物理上进不了打字节奏（200ms/字 vs 300ms+ 热调用）。
+        # 整句场景有天然停顿（打完一串键才看结果），AI 300ms 能赶上。
+        if len(self.buffer) > 4 and self.cfg.get("ai", {}).get("enabled", True):
             self.ai.request(self.buffer, "".join(self.context))
 
     def _commit(self, word):
@@ -444,11 +505,15 @@ class Engine:
             if all(s in self.de.valid_sylls for s in syls):
                 py = cand
         self.buffer = ""
+        self.page = 0
         self.q.put(("hide",))
         self.context.append(word)
         self.stats["commits"] += 1
+        # bigram 学习：上一个上屏词 → 本词（越用越准的来源）
+        self.rr.learn(self.last_word, word)
+        self.last_word = word
         if py:
-            self.de.remember(word, py)  # 新词落盘 user_dict.txt，旧词会话内调频
+            self.de.remember(word, py)  # 新词入库/旧词调频，批量落盘
         send_unicode(word)  # 注入事件自带 INJECTED 标志，会被钩子放行
 
     # ---- 安装/卸载 ----
@@ -506,7 +571,9 @@ def main():
                 if kind == "show":
                     _, code, cands, n_mb, pos = item
                     last_pos = pos
-                    shown = [(w, i == 0) for i, w in enumerate(cands)]
+                    off = eng.page * eng.n_show
+                    chunk = cands[off: off + eng.n_show]
+                    shown = [(w, i == 0) for i, w in enumerate(chunk)]
                     ui.update(code, shown, pos)
                 elif kind == "hide":
                     ui.hide()
@@ -519,10 +586,13 @@ def main():
                     ui.flash(text, last_pos)
                     root.after(900, ui.hide)
                 elif kind == "ai":
-                    # AI 结果返回：用当前键入码刷新（码表 k 项之后顺延插入）
+                    # AI 结果返回：失效缓存后重算（把 AI 候选并入），按当前页显示
                     if eng.buffer:
+                        eng._cache_code = None
                         cands, n_mb = eng.compute(eng.buffer)
-                        shown = [(w, i == 0) for i, w in enumerate(cands)]
+                        off = eng.page * eng.n_show
+                        chunk = cands[off: off + eng.n_show]
+                        shown = [(w, i == 0) for i, w in enumerate(chunk)]
                         if shown:
                             ui.update(eng.buffer, shown, last_pos)
                         else:
@@ -541,6 +611,7 @@ def main():
     print(" 灵鹤 LingHe  外挂式 AI 输入法（小鹤音形向）")
     print("  开关热键: Ctrl+Alt+L    退出: 控制台 Ctrl+C")
     print("  空格=首选  ;=2选  '=3选  数字1-9=选字  Esc=清码")
+    print("  =/Tab=下一页  -=上一页  回车=上屏英文  Shift单击=上屏英文/切中英")
     print("=" * 56)
     for s in lines:
         print(s)
@@ -558,6 +629,9 @@ def main():
         root.protocol("WM_DELETE_WINDOW", lambda: (eng.uninstall_hook(), root.destroy()))
     poll()
     root.mainloop()
+    # 退出前把用户词频与 bigram 共现落盘（防丢）
+    eng.de.flush()
+    eng.rr.flush()
     return 0
 
 
