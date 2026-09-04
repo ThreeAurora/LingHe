@@ -1,5 +1,6 @@
 {
   "ai": {
+    "enabled": true,
     "mode": "auto",
     "local_urls": ["http://localhost:11434", "http://localhost:1234"],
     "api_base": "",
@@ -12,5 +13,6 @@
   "mabiao_dir": "mabiao",
   "max_buffer_len": 12,
   "candidate_count": 9,
+  "candidate_pool": 45,
   "context_max": 120
 }
