@@ -62,11 +62,21 @@ class DictEngine:
     # ---------- 加载 ----------
 
     def load_dir(self, dir_path: str) -> int:
-        """同步加载（含后台模式由 load_dir_async 调用）。"""
+        """同步加载（含后台模式由 load_dir_async 调用）。
+
+        二进制缓存：首次文本解析约 20~23s（152.9 万词），之后走 marshal 缓存
+        数秒内完成。缓存键=词库文件 (名字,大小,mtime) 签名，任何词库文件变化
+        自动失效重建。缓存文件可再生，不入库（gitignore）。
+        """
         import time
         t0 = time.perf_counter()
         if not os.path.isdir(dir_path):
             return 0
+        cache_path = os.path.join(dir_path, ".cache.bin")
+        sig = self._files_sig(dir_path)
+        if sig and self._load_cache(cache_path, sig):
+            self._after_load(dir_path, t0)
+            return self.size
         self._load_char_pinyin(os.path.join(dir_path, "char_pinyin.txt"))
         raw = []  # (weight, word, py_str or None)
         flat_files = []
@@ -112,8 +122,82 @@ class DictEngine:
         self.user_dict_path = os.path.join(dir_path, "user_dict.txt")
         ms = round((time.perf_counter() - t0) * 1000)
         extra = ("，其中 %s 无词频列已按低可信权重处理" % "/".join(flat_files)) if flat_files else ""
-        self.log("[底库] %d 个词条（全拼/简拼双索引），加载 %dms%s" % (self.size, ms, extra))
+        self.log("[底库] %d 个词条（全拼/简拼双索引），文本解析 %dms%s，已写缓存下次秒开"
+                 % (self.size, ms, extra))
+        self._dump_cache(cache_path, sig)
         return self.size
+
+    # ---------- 二进制缓存（marshal：比文本解析快数倍，词库文件变化自动失效）----------
+
+    def _files_sig(self, dir_path):
+        out = []
+        try:
+            names = sorted(os.listdir(dir_path))
+        except OSError:
+            return None
+        for name in names:
+            if not (name.endswith(".yaml") or name.endswith(".txt")) or name == "user_dict.txt":
+                continue
+            p = os.path.join(dir_path, name)
+            try:
+                st = os.stat(p)
+                out.append((name, st.st_size, int(st.st_mtime)))
+            except OSError:
+                return None
+        return tuple(out)
+
+    def _load_cache(self, path, sig):
+        try:
+            import marshal
+            with open(path, "rb") as f:
+                data = marshal.load(f)
+            if data.get("sig") != sig:
+                return False
+            self.by_pinyin = data["by_pinyin"]
+            self.by_initial = data["by_initial"]
+            self.word_py = data["word_py"]
+            self.word_weight = data["word_weight"]
+            self.char_py = data["char_py"]
+            self.valid_sylls = data["valid_sylls"]
+            self.size = len(self.word_py)
+            return True
+        except Exception:
+            return False
+
+    def _dump_cache(self, path, sig):
+        try:
+            import marshal
+            with open(path, "wb") as f:
+                marshal.dump({
+                    "sig": sig,
+                    "by_pinyin": self.by_pinyin,
+                    "by_initial": self.by_initial,
+                    "word_py": self.word_py,
+                    "word_weight": self.word_weight,
+                    "char_py": self.char_py,
+                    "valid_sylls": self.valid_sylls,
+                }, f)
+        except Exception:
+            try:
+                os.remove(path)  # 半成品宁可删掉，别留一个损坏缓存
+            except OSError:
+                pass
+
+    def _after_load(self, dir_path, t0):
+        """缓存命中路径：合入用户词（缓存不含 user_dict，它变化频繁）+ 日志。"""
+        import time
+        d = self._load_user_dict(dir_path)
+        for w, (p, c) in d.items():
+            if w not in self.word_py:
+                self.word_py[w] = p
+                self.word_weight[w] = 0
+                self.by_pinyin.setdefault(p, []).append((100000 + c, w))
+                self.by_initial.setdefault(" ".join(_sm_key(s) for s in p.split()), []).append((100000 + c, w))
+                self.size += 1
+        self.loaded = True
+        self.user_dict_path = os.path.join(dir_path, "user_dict.txt")
+        ms = round((time.perf_counter() - t0) * 1000)
+        self.log("[底库] %d 个词条（全拼/简拼双索引），缓存加载 %dms" % (self.size, ms))
 
     def load_dir_async(self, dir_path: str, on_done=None):
         """后台加载：输入法立即可用，底库就绪后自动上线。"""
