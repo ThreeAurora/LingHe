@@ -155,11 +155,14 @@ class StatReranker:
             return ()
         return tuple(w for _, w in lst[:limit])
 
-    def viterbi(self, keys, mode="ini", n=5):
+    def viterbi(self, keys, mode="ini", n=5, ret_cost=False):
         """在音节序列上切分出最优整句，返回 n 个候选整句。
 
         keys: ['w','i','l','y','g','b','z']（mode="ini" 声母简拼）
               或 ['zhan','mu','si']（mode="py" 全拼音节）
+        ret_cost=True 时返回 (句子, 代价, 音节数)，供调用方把全拼/简拼两路
+        候选按「每字平均代价」合并排序——两路的代价不可直接比较（词数不同），
+        但每字平均代价语义一致。
         """
         keys = tuple(keys[:MAX_KEYS])
         if not keys:
@@ -168,13 +171,13 @@ class StatReranker:
         hit = self._viterbi_cache.get(ck)
         if hit is not None:
             return hit
-        out = self._viterbi_raw(keys, mode, n)
+        out = self._viterbi_raw(keys, mode, n, ret_cost)
         if len(self._viterbi_cache) > 256:
             self._viterbi_cache.clear()
         self._viterbi_cache[ck] = out
         return out
 
-    def _viterbi_raw(self, keys, mode, n):
+    def _viterbi_raw(self, keys, mode, n, ret_cost=False):
         m = len(keys)
         # dp[j] = [(cost, words_tuple, last_word), ...] 保留 BEAM 条最优
         dp = [None] * (m + 1)
@@ -217,7 +220,7 @@ class StatReranker:
             s = "".join(seq)
             if s not in seen:
                 seen.add(s)
-                out.append(s)
+                out.append((s, c, m) if ret_cost else s)
             if len(out) >= n:
                 break
         return out
