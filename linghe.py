@@ -47,6 +47,7 @@ LLKHF_INJECTED = 0x10
 
 VK_BACK, VK_ESCAPE, VK_SPACE, VK_RETURN = 0x08, 0x1B, 0x20, 0x0D
 VK_SHIFT, VK_CONTROL, VK_MENU = 0x10, 0x11, 0x12
+VK_LSHIFT, VK_RSHIFT = 0xA0, 0xA1  # 低级钩子对 Shift 上报左右原始码，不折叠成 0x10
 VK_LWIN, VK_RWIN = 0x5B, 0x5C
 VK_TAB = 0x09
 VK_L = 0x4C
@@ -342,8 +343,9 @@ class Engine:
         if info.flags & LLKHF_INJECTED:
             return user32.CallNextHookEx(None, ncode, wparam, lparam)  # 自己注入的，放行
 
-        # Shift 单击：组码中=上屏已敲的英文（搜狗/微软惯例）；空码=中英切换
-        if vk == VK_SHIFT:
+        # Shift 单击：组码中=上屏已敲的英文（搜狗/微软惯例）；空码=中英切换。
+        # 注意 LL 钩子 vkCode 是 VK_LSHIFT/VK_RSHIFT，不折叠成 VK_SHIFT。
+        if vk in (VK_SHIFT, VK_LSHIFT, VK_RSHIFT):
             if msg in (WM_KEYDOWN, WM_SYSKEYDOWN):
                 self.shift_t0 = kernel32.GetTickCount64()
                 self.shift_alone = True
