@@ -61,6 +61,58 @@ def iter_pairs(lines):
             prev = tok
 
 
+# ---------- 短语挖共现 ----------
+# 词库本身就是一份「微语料」：吃包子 / 一个包子 / 看电影 这类多字短语在
+# 库里存在，就蕴含其子词的相邻共现——(吃,包子) / (一个,包子) / (看,电影)。
+# SIGHAN 是 1998 年新闻语料，动词-食物/器物这类口语搭配覆盖极差
+# （(吃,饭)=0、(一个,包子)=0），短语挖矿恰好补上这块。
+# 切分用「贪心 ≤2 字块」（与 caret_ctx.tail_words 同方案），保证挖出的
+# 对与运行时多上文切词的粒度对得上。
+
+def load_dict_words(dicts_dir):
+    """收集词库全部纯汉字词条（挖矿的短语来源 + 切分的块校验集）。"""
+    words = set()
+    for name in sorted(os.listdir(dicts_dir)):
+        if not name.endswith(".yaml"):
+            continue
+        path = os.path.join(dicts_dir, name)
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    line = line.rstrip("\r\n")
+                    if not line or line[0] in "#.":
+                        continue
+                    w = line.split("\t")[0].strip()
+                    if len(w) >= 2 and is_hanzi_word(w):
+                        words.add(w)
+        except OSError:
+            continue
+    return words
+
+
+def mine_phrase_pairs(words):
+    """把 ≥3 字短语切成 ≤2 字块，产出相邻 (上块, 下块)。"""
+    for ph in words:
+        if len(ph) < 3:
+            continue
+        blocks = []
+        pos = 0
+        ok = True
+        while pos < len(ph):
+            if pos + 2 <= len(ph) and ph[pos:pos + 2] in words:
+                blocks.append(ph[pos:pos + 2])
+                pos += 2
+            elif is_hanzi_word(ph[pos]):
+                blocks.append(ph[pos])
+                pos += 1
+            else:
+                ok = False
+                break
+        if ok:
+            for a, b in zip(blocks, blocks[1:]):
+                yield a, b
+
+
 def main():
     files = [
         ("msr_training.utf8", "utf-8"),
@@ -91,6 +143,23 @@ def main():
     kept_char = {k: v for k, v in char_count.items() if v >= MIN_COUNT}
     print("词级唯一 %d -> 保留 %d；字级唯一 %d -> 保留 %d"
           % (len(pair_count), len(kept), len(char_count), len(kept_char)))
+
+    # 短语挖矿：词库多字短语 → 相邻子词对（出现即收，词条是人工炼过的）
+    # 计数语义修正（2026-09-05）：挖矿数的是「含该相邻对的短语个数」，是
+    # 构词产出率，不是文本频率——腾讯库 19 个「一个不X」成语家族会把
+    # (一个,不) 灌到 19，压过真实文本对 (一个,包子)=1，整句切分因此跑偏
+    # （ilygbz→成立一个不在 案）。乘 0.25 并入：短语存在=可能性证据，
+    # 语料共现才是频次证据，两者不再同权。
+    words = load_dict_words(os.path.join(BASE, "dicts"))
+    mined = Counter()
+    for a, b in mine_phrase_pairs(words):
+        if len(a) > 1 or len(b) > 1:  # 至少一侧是多字块，纯字对留给字级表
+            mined[(a, b)] += 1
+    for k, v in mined.items():
+        kept[k] = kept.get(k, 0) + v * 0.25  # 浮点：0.25 取整会把 (一个,包子)=1 这类关键小对抹成 0
+    print("短语挖矿：%d 词条 -> %d 对（x0.25 并入词级表）" % (len(words), len(mined)))
+    for a, b in (("吃", "包子"), ("一个", "包子"), ("看", "电影"), ("一个", "不")):
+        print("  (%s,%s) = %s" % (a, b, kept.get((a, b), 0)))
     if not kept:
         print("没有可用共现，退出")
         return 1
@@ -100,6 +169,7 @@ def main():
     top = sorted(kept.items(), key=lambda kv: -kv[1])
     with open(OUT_TXT, "w", encoding="utf-8") as f:
         f.write("# 预训练共现表（SIGHAN Bakeoff 2005 msr+pku 分词语料统计，非商业许可）\n")
+        f.write("# + 词库短语挖矿（多字短语的相邻子词对，calibrate 后词库 2026-09-05）\n")
         f.write("# 真数据在 cooc_pre.bin（marshal：{word:{}, char:{}}）。本文件仅 top 千条供审阅。\n")
         for (a, b), c in top[:1000]:
             f.write("%s\t%s\t%d\n" % (a, b, c))
