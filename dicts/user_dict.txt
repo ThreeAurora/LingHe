@@ -1,16 +1,46 @@
-其	qi	1
+# 灵鹤用户词库：上屏自动记忆（词\t拼音\t次数）
+做	zuo	7
+吃	chi	5
+太	tai	5
+文件	wen jian	5
+吧	ba	3
+模型	mo xing	3
+行	hang	2
+只	zhi	2
+呢	ne	2
+其	ji	2
+先	xian	2
+子	zi	2
+路	lu	2
+下面	xia mian	2
+防止	fang zhi	2
 右	you	1
-吧	ba	1
-做	zuo	1
-先	xian	1
 新	xin	1
-行	xing	1
-只	zhi	1
 全	quan	1
-么	me	1
-无	wu	1
-子	zi	1
+么	ma	1
+无	mo	1
 条	tiao	1
-路	lu	1
-太	tai	1
 如	ru	1
+取消	qu xiao	1
+还是	hai shi	1
+睡醒	shui xing	1
+最	zui	1
+实	shi	1
+一个	yi ge	1
+告诉	gao su	1
+它们	ta men	1
+模仿	mo fang	1
+优雅	you ya	1
+值得	zhi de	1
+被	bei	1
+太大	tai da	1
+不过	bu guo	1
+质量	zhi liang	1
+一样	yi yang	1
+件	jian	1
+最终	zui zhong	1
+手心	shou xin	1
+手印	shou yin	1
+与	yu	1
+心态	xin tai	1
+波	bo	1
