@@ -30,6 +30,7 @@ from dict_engine import DictEngine
 from fuma import FuMa
 from mabiao import MaBiao
 from neural_rerank import NeuralReranker
+from ai_llm_judge import QwenJudge
 from rerank import StatReranker
 from xiaohe import decode_syllable
 import caret_ctx
@@ -308,6 +309,21 @@ class Engine:
         else:
             log("[神经] 已按配置停用（neural.enabled=false）")
 
+        # LLM 终审裁判（Qwen2.5-0.5B 整句判别，2026-09-05 接棒 RBT3）：
+        # RBT3 的新闻语料偏差是实测天花板（文件体现出西湖醋鱼 -7.86 压过
+        # 我今天想吃西湖醋鱼 -9.21）；Qwen 在口语语料上预训练，判别式整句
+        # logP 完胜（-3.52 vs -5.34）。生成式 0.5B 不行（五种 prompt 束搜索
+        # 全败），判别式 0.5B 实测两验收用例双双登顶。就绪后接管精排请求，
+        # 未就绪时回退 RBT3——回调与分数方向量纲完全兼容（每字 logP）。
+        jcfg = cfg.get("judge", {})
+        self.judge = QwenJudge(os.path.join(base_dir, jcfg.get("model_dir", "ai_llm/qwen25-05b-hf")),
+                               log=log)
+        self.judge.on_result = self._on_neural
+        if jcfg.get("enabled", True):
+            self.judge.load_async()
+        else:
+            log("[LLM裁判] 已按配置停用（judge.enabled=false）")
+
         self.buffer = ""
         self.enabled = True
         self.cn_mode = True          # Shift 单击切换中/英
@@ -430,6 +446,18 @@ class Engine:
             # 「我今天想吃西湖醋鱼」们塞进池，排序交给神经裁决。
             if n >= 5:
                 vpool += self.rr.anchor_sentences(list(code), "ini", 12, prev=prev)
+                # 贪心最大匹配通道：目标句每段都是词库真实词（给你=7、
+                # 东西=3、测试一下=1、西湖醋鱼=1），统计 beam 却被「文件
+                # 体现|出」类书面长词链垄断（beam256 也召不回）——本通道
+                # 不管代价只管用真实词填满键串，正反两向各产出一条骨架句，
+                # 排序交伪似然终审（整句组纯神经排序置顶）
+                vpool += self.rr.max_match_sentences(list(code), "ini")
+                # 口语字链通道（2026-09-05 回归案 wilygbz 钉死）：词库/口语
+                # 2gram 里 吃了/我吃/了个 全在，但 viterbi 书面代价、锚点
+                # 书面门槛、max_match 的「外出旅游」贪心三路都召不回
+                # 「我吃了一个包子」。真人打真实句子时逐键字链就是目标句
+                # 本身——本通道只管召回（top6 整链进池），排序交 LLM 终审
+                vpool += self.rr.char_chains(list(code), "ini", 6)
             vpool.sort(key=lambda t: t[1] / max(1, t[2]))
             for s, c, m in vpool:
                 if s in seen:
@@ -438,10 +466,16 @@ class Engine:
                 if s not in pool or cps < pool[s]:
                     pool[s] = cps  # 同串取更优代价（词条 vs 切分谁准谁上）
         ranked_pool = sorted(pool.items(), key=lambda kv: kv[1])
-        dict_side = [w for w, _ in ranked_pool][: self.n_pool]
+        # 词截断、整句豁免：骨架句（锚点串接/最大匹配）的统计均价结构性
+        # 偏高——「的|乡村|是一项」类高频短词链每字便宜 ~2 nat，正是口语
+        # 串的死因。截断会让目标句见不到神经终审（2026-09-05 实测钉死），
+        # 句子全保留进池，排序交给 _on_neural 整句组纯神经裁决。
+        dict_side = [w for w, _ in ranked_pool if len(w) < 5][: self.n_pool]
+        sents_all = [w for w, _ in ranked_pool if len(w) >= 5]
         self._cache_pool_scores = dict(ranked_pool)  # 神经精排的统计基底
-        base = mb_hits + mb_prefix + dict_side
-        base = base[: self.n_pool]
+        base = (mb_hits + mb_prefix + dict_side)[: self.n_pool]
+        seen_base = set(base)
+        base += [w for w in sents_all if w not in seen_base]
         n_mb = len(mb_hits) + len(mb_prefix)
         # AI 顺延：静态侧命中 k 个，AI 从第 k+1 位起
         merged = base[:]
@@ -672,16 +706,23 @@ class Engine:
         if not base or n_mb >= len(base):
             return
         tail = base[n_mb:]
-        # 符号约定：logP 是概率对数（越大越好），代价越小越好 → 用减法：
-        # 概率高（logP 趋近 0）的候选被减得少 = 代价保持低 = 排前。
-        rescored = [(self._cache_pool_scores[w] - self.neural_lambda * scores[w], w)
-                    for w in tail if w in scores and w in self._cache_pool_scores]
+        # 整句与词分两组：整句组按**纯神经分**排序置顶。为什么不用融合式：
+        # 统计代价里口语串结构性输给书面长词链 2 nat+，λ=1 的神经增益
+        # (~1.2) 追不回——整句候选的价值由伪似然独立裁决（豆包式：长码
+        # 用户要的就是整句，置顶展示）。词组维持统计+神经融合。
+        sents = [(scores[w], w) for w in tail
+                 if w in scores and w in self._cache_pool_scores and len(w) >= 5]
+        words = [(self._cache_pool_scores[w] - self.neural_lambda * scores[w], w)
+                 for w in tail
+                 if w in scores and w in self._cache_pool_scores and len(w) < 5]
         rest = [w for w in tail if w not in scores or w not in self._cache_pool_scores]
-        rescored.sort()
-        merged = base[:n_mb] + [w for _, w in rescored] + rest
+        sents.sort(reverse=True)   # logP 越大（越接近 0）越通顺
+        words.sort()
+        merged = base[:n_mb] + [w for _, w in sents] + [w for _, w in words] + rest
         self._cache_cands = merged
         self.q.put(("show", self.buffer, merged, n_mb, self._last_pos))
-        self.log("[神经] %s 精排%d词 %dms" % (code, len(rescored), ms))
+        self.log("[神经] %s 精排整句%d 词%d %dms" % (
+            code, len(sents), len(words), ms))
 
     def _eat(self):
         self.stats["eaten"] += 1
@@ -699,14 +740,11 @@ class Engine:
             self.q.put(("show", self.buffer, cands, n_mb, pos))
         else:
             self.q.put(("think", self.buffer, pos))  # 静态零命中，AI 在途
-        # 神经精排：全窗口送裁（豆包式「候选自我修正」）。池里不只词——
-        # viterbi 整句也在（5~12 字），max_cand=16 的伪似然能整句进模型。
-        # 实测整句裁决区分度极强（口语通顺度是 MLM 的参数知识）：
-        # 「那我给你个东西测试一下」-6.56 完胜新闻腔「年我国能够的乡村
-        # 是一些」-7.78——统计共现（新闻语料）系统性偏向书面腔，口语句
-        # 的召回/排序缺口由神经层补。异步不阻塞击键。
-        if self.nr.ready and len(self.buffer) >= 2 and len(cands) > n_mb:
-            self.nr.request(self.buffer, self.ctx_tail_text, cands[n_mb:])
+        # 精排：全窗口送裁（豆包式「候选自我修正」）。优先 LLM 裁判（整句
+        # 判别区分度完胜），未就绪回退 RBT3。异步不阻塞击键。
+        src = self.judge if self.judge.ready else self.nr
+        if src.ready and len(self.buffer) >= 2 and len(cands) > n_mb:
+            src.request(self.buffer, self.ctx_tail_text, cands[n_mb:])
         # AI 只在长码（第 5 码起）时补位：短码静态侧（码表+底库+重排）已足够强，
         # 生成式 LLM 也物理上进不了打字节奏（200ms/字 vs 300ms+ 热调用）。
         # 整句场景有天然停顿（打完一串键才看结果），AI 300ms 能赶上。

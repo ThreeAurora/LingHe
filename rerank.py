@@ -76,6 +76,10 @@ SPAN_CANDS = 48  # 每个跨度召回多少候选（去重前）。8 太窄：�
                  # 48+去重后 覆盖到唯一排名 ~70。
 MAX_KEYS = 16   # 整句最多处理多少音节（安全上限）
 
+ANCHOR2_FREQ = 3000   # 2 音节锚点的最低词频。2 音节 rank≤2 的词是强锚
+                      # （东西 dx rank2），但没频次门槛的话每个双声母键的
+                      # rank2（年味/那次）全成锚，垃圾句淹池。
+
 
 class StatReranker:
     def __init__(self, dict_engine, log=print):
@@ -91,11 +95,15 @@ class StatReranker:
         self._lock = threading.Lock()
         self._viterbi_cache = {}
         self._cache_ver = 0       # bigram 变化时自增，作废旧缓存
+        self.sp2 = None           # 口语 char-2gram（char_chains 懒加载）
+        self._char_inv_cache = None
+        self.dir = ""             # dicts 目录（char_chains 找 spoken_2gram 用）
 
     # ---------- 持久化：用户 bigram + 预训练共现 ----------
 
     def load(self, dir_path):
         """加载用户二元表与预训练共现表（后者由 build_cooc.py 生成，可缺省）。"""
+        self.dir = dir_path
         self._path = os.path.join(dir_path, "user_bigram.txt")
         n = 0
         try:
@@ -128,8 +136,35 @@ class StatReranker:
         except (OSError, ValueError):
             self.pre_word = {}
             self.pre_char = {}
+        # 口语词频表（wordfreq zipf×100）：底库词频源自书面语料，口语词
+        # （想吃 rank11）被书面词（消除/县城/薪酬 rank 前列）系统性压制——
+        # 锚点选择按口语序重排（2026-09-05 wjtxixhcy 用例钉死）。表缺失
+        # 时优雅降级为空表（锚点回退库序）。
+        self.spoken = {}
+        sp_path = os.path.join(dir_path, "spoken_freq.txt")
+        try:
+            with open(sp_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    p = line.split("\t")
+                    if len(p) >= 2:
+                        self.spoken[p[0]] = int(p[1])
+            if self.spoken:
+                self.log("[共现] 口语词频 %d 词" % len(self.spoken))
+        except OSError:
+            pass
         self._build_next_index()
         return n
+
+    def _spoken(self, w):
+        """口语频 zipf×100（缺失回退库 weight 的弱归一值）。"""
+        z = self.spoken.get(w)
+        if z:
+            return z
+        wt = self.de.weight(w)
+        return min(500, int(math.log(max(1, wt)) * 40))  # 库频弱映射，量级对齐
 
     def flush(self):
         """把 bigram 表写回磁盘（退出时调用）。只写用户表——预训练表是只读的。"""
@@ -376,61 +411,321 @@ class StatReranker:
         self._viterbi_cache[ck] = out
         return out
 
-    def anchor_sentences(self, keys, mode="ini", n=6, prev=""):
-        """长词锚定召回：3~4 音节键串的 top1 命中词，强制构造整句进池。
+    def max_match_sentences(self, keys, mode="ini"):
+        """贪心最大匹配通道：像分词器一样从前向后，每步取最长跨度键串的
+        top1 词；再从后向前来一遍。产出两条「骨架句」。
 
-        背景（2026-09-05 主人 wjtxixhcy 用例）：主 beam 的统计代价系统性
-        偏向「新车型|后槽牙」类词典可命中长词链——每字 -15.6，把「我今天
-        想吃西湖醋鱼」这类口语串全程剪枝；给长词加 boost 又引发军备竞赛
-        （3 音节键串候选少，top3 门槛形同虚设）。锚定通道绕开零和竞争：
-        对每个 3~4 音节跨度，取该键串的 top1 词做锚，前缀/后缀用常规
-        viterbi 最优路径填充，整句直进候选池——检索便宜、裁决全面，排序
-        交给神经层（「我今天想吃西湖醋鱼」的 MLM 通顺度完爆荒谬长词链）。
+        动机（2026-09-05 主人验收用例）：目标句的每一段都是词库真实词且
+        排名靠前（给你 gn=7、东西 dx=3、测试一下 cyx=1、西湖醋鱼 xhcy=1），
+        但统计 beam 输给「文件体现|出」类书面长词链（L 奖励+高频 unigram），
+        beam256 也召不回。最大匹配不看代价只管「每个键段都用真实词填满」，
+        正向产出「我今天想吃西湖醋鱼」、11 键产出「那我给你个东西测试一下」
+        的完整骨架——垃圾风险（段 top1 可能是怪词）由伪似然终审兜底。
 
-        返回 [(句子, 代价, 音节数)]，代价是粗粒度拼接值（接缝 bigram 不算），
-        只用于与整句候选按每字均价比价，精度要求不高。
+        返回 [(句子, 代价, 音节数)]，代价给固定中位值（本通道不走统计比价）。
         """
+        m = len(keys)
+        if m < 3:
+            return []
+        out, seen = [], set()
+
+        def greedy(seq):
+            words, i = [], 0
+            while i < len(seq):
+                for L in (4, 3, 2, 1):
+                    if i + L <= len(seq):
+                        lst = self.de.by_pinyin.get(" ".join(seq[i:i + L])) \
+                            if mode == "py" \
+                            else self.de.by_initial.get(" ".join(seq[i:i + L]))
+                        if lst:
+                            words.append(lst[0][1])
+                            i += L
+                            break
+                else:
+                    i += 1  # 该键无任何词（罕见）：跳过
+            return words
+
+        for rev in (False, True):
+            seq = list(keys)[::-1] if rev else list(keys)
+            words = greedy(seq)
+            if rev:
+                words = words[::-1]  # 从尾向头收集的词要翻回正序
+            if not words:
+                continue
+            s = "".join(words)
+            if s in seen or len(s) < 3:
+                continue
+            seen.add(s)
+            # 代价=Σ词代价（与主 beam 同量级，保证池内比价不虚）；本通道的
+            # 价值不在统计比价，在「产出目标骨架句」交给伪似然终审
+            total = sum(self._cost(w) for w in words)
+            out.append((s, total, len(s)))
+        return out
+
+    def _char_inv(self):
+        """单字声母索引（小鹤键位口径），按口语频排序。懒加载缓存。"""
+        if self._char_inv_cache is not None:
+            return self._char_inv_cache
+        SM2KEY = {"zh": "v", "ch": "i", "sh": "u"}
+        inv = {}
+        for w, py in self.de.word_py.items():
+            if len(w) != 1 or not ("\u4e00" <= w <= "\u9fff"):
+                continue
+            parts = py.split()
+            if not parts:
+                continue
+            k = parts[0][:2] if parts[0][:2] in ("zh", "ch", "sh") \
+                else parts[0][0]
+            inv.setdefault(SM2KEY.get(k, k), set()).add(w)
+        self._char_inv_cache = {
+            k: sorted(v, key=lambda w: -self._spoken(w))[:10]
+            for k, v in inv.items()}
+        return self._char_inv_cache
+
+    def char_chains(self, keys, mode="ini", n=6, beam=32, prev=""):
+        """口语字链召回：每键位连一个汉字，口语 unigram+char-2gram 打分，
+        束搜索吐 n 条整链。
+
+        动机（2026-09-05 回归案 wilygbz 钉死）：词库与口语 2gram 里
+        吃了(7747)/我吃(3782)/了个(8389) 全都在，但 viterbi 的书面代价、
+        锚点的书面词频门槛、max_match 的「外出旅游」贪心，三路都召不回
+        「我吃了一个包子」。真人打真实句子时**逐键取字的字链就是目标句
+        本身**（nwgngdxcuyx 逐位=那我给你个东西测试一下 11 字全对）——
+        本通道不与统计比价，专管把字链塞进池，排序交 LLM 终审。
+
+        打分：-log10(口语频+1) 逐字累加 + 字对 bigram 未见罚（口语 2gram
+        表 21 万对，吃接了/个接一 这类接对是强证据）。垃圾链（每个键都
+        取到同音高频字但不成句）由终审降权，召回侧宁滥勿缺。
+        """
+        m = len(keys)
+        if m < 4 or m > MAX_KEYS:
+            return []
+        if self.sp2 is None:
+            self.sp2 = {}
+            p2 = os.path.join(self.dir, "spoken_2gram.txt")
+            if os.path.isfile(p2):
+                with open(p2, "r", encoding="utf-8") as f:
+                    for line in f:
+                        p = line.split()
+                        if len(p) >= 2:
+                            try:
+                                self.sp2[p[0]] = int(p[1])
+                            except ValueError:
+                                pass
+        inv = self._char_inv()
+        states = [(0.0, "", "")]
+        for k in keys:
+            cands = inv.get(k, [])
+            if not cands:
+                return []
+            nxt = []
+            for sc, s, last in states:
+                for c in cands:
+                    # unigram：-log10(口语频)，缺表字回退库频，双缺重罚
+                    f = self.spoken.get(c) or 0
+                    if f:
+                        cu = -math.log10(f)
+                    else:
+                        wt = self.de.weight(c)
+                        cu = -math.log10(wt) if wt else 3.0
+                    # bigram：口语 2gram 全权重（-log10 域，与 unigram 同
+                    # 量纲直接可比——我吃 3782→-3.6 vs 缺证 +0.5，差距
+                    # 足以压过「出/就/没」类高频字的 unigram 先验）
+                    if last:
+                        t = self.sp2.get(last + c) or 0
+                        cb = -math.log10(t + 1) if t else 0.5
+                    else:
+                        cb = 0.0
+                    nxt.append((sc + cu + cb, s + c, c))
+            nxt.sort(key=lambda t: t[0])
+            seen, pruned = set(), []
+            for sc, s, c in nxt:
+                if s in seen:
+                    continue
+                seen.add(s)
+                pruned.append((sc, s, c))
+                if len(pruned) >= beam:
+                    break
+            states = pruned
+        out, seen_s = [], set()
+        for sc, s, _ in states:
+            if s in seen_s or len(s) < m:
+                continue
+            seen_s.add(s)
+            out.append((s, sc, m))
+            if len(out) >= n:
+                break
+        return out
+
+    def anchor_sentences(self, keys, mode="ini", n=32, prev=""):
+        """锚点串接召回：强锚（长跨度精准命中 / 双声母高频 rank≤2）按键序
+        强制串成整句，缝隙用 viterbi top1 填充。
+
+        背景（2026-09-05 主人验收用例钉死）：目标句「那我给你个东西测试
+        一下」每段都是真实词且靠前（东西 dx rank2、测试一下 cuyx rank1），
+        但统计 beam 里「的|乡村|是一项」类高频短词链每字便宜 ~2 nat，
+        beam256 也召不回；旧单锚版的前缀变体同样来自统计 viterbi top3，
+        「东西」在 dx 段 rank2 永远进不了前缀——目标句整句缺席。串接
+        思路：不做全句统计比价（这正是口语串的死因），把互不重叠的强锚
+        按键序首尾相接，锚间缝隙由 viterbi 最优路径填充——
+        「那我给你个」(前缀top1) +「东西」+「测试一下」= 目标句整句进池，
+        排序交给神经终审（口语通顺度完爆书面链，-6.56 vs -7.78 实测）。
+
+        锚点判定：
+        - 4 音节键串 top1 必锚（键串特异性高，西湖醋鱼/测试一下）。
+        - 2 音节键串**去重后** rank≤3 且词频 ≥ ANCHOR2_FREQ 才锚（东西
+          50万 ✓、想吃 5.8万 ✓、年味 数百 ✗）。rank 必须按去重后序数：
+          by_initial 含重复词条（xi 原始 top5 是 形成/宣传/新车/形成/宣传），
+          按原始索引扫会漏真锚（实测钉死）。
+        - 3 音节键串一律不锚：候选 ≤8 的门槛挡不住「小吃小喝/通讯程序/
+          给你惯的」类低特异性怪词——它们全是垃圾句源（2026-09-05 追踪
+          实测），span4/span2 已足够覆盖真锚。
+
+        核心轮询顺序按「跨度长→词频高」而非键序：span4 真锚（西湖醋鱼/
+        测试一下）必须先于垃圾 span2 锚（内外/那位/危机/文件）被轮到。
+
+        右侧串接取**就近优先**（起点最小，同起点按质量序）：9 键用例里
+        核心=今天 时 pos=3 处的「想吃」若被全局质量序更前的西湖醋鱼
+        跳过，缝隙 viterbi(xi) 只能填出「形成」——就近串接才保住
+        「今天+想吃+西湖醋鱼」的骨架（2026-09-05 追踪实测钉死）。
+
+        返回 [(句子, 代价, 音节数)]，代价=粗拼接值（不参与最终排序，
+        终审由整句伪似然负责）。
+        """
+        keys = tuple(keys[:MAX_KEYS])
         m = len(keys)
         if m < 4:
             return []
-        out, seen_anchor, seen_sent = [], set(), set()
-        for i in range(0, m - 2):
-            for j in (i + 3, i + 4):
-                if j > m:
+        # ---- 收集强锚 (i, j, word) ----
+        cores = []
+        for i in range(m):
+            for L in (2, 4):
+                if i + L > m:
                     continue
-                key_str = " ".join(keys[i:j])
-                lst = self.de.by_pinyin.get(key_str) if mode == "py" \
-                    else self.de.by_initial.get(key_str)
+                lst = self.de.by_pinyin.get(" ".join(keys[i:i + L])) \
+                    if mode == "py" \
+                    else self.de.by_initial.get(" ".join(keys[i:i + L]))
                 if not lst:
                     continue
-                w = lst[0][1]
-                if w in seen_anchor:
-                    continue
-                # 锚点门槛：4 字词必锚（4 音节键串候选天然稀少，rank1 就是
-                # 用户想要的）；3 字词只在该键串候选极少数时锚——否则「和
-                # 参与/小吃下」这类 3 字词占满锚点，真锚（西湖醋鱼）轮不到。
-                if len(w) < 4 and len(lst) > 8:
-                    continue
-                seen_anchor.add(w)
-                pres = self.viterbi(keys[:i], mode, 3, ret_cost=True,
-                                    prev=prev) if i else [("", 0.0, 0)]
-                sufs = self.viterbi(keys[j:], mode, 1, ret_cost=True) if j < m \
-                    else [("", 0.0, 0)]
-                if not pres or not sufs:
-                    continue
-                ss, sc, _ = sufs[0]
-                # 前缀出 top3 变体：前缀的统计代价被「文件体现」类 4 字词条
-                # （L×3 奖励）垄断，「我今天想吃」这类口语前缀排不进 top1，
-                # 但它的 MLM 通顺度完爆——多路进池，排序交给神经裁决。
-                for ps, pc, _ in pres:
-                    sent = ps + w + ss
-                    if sent in seen_sent:
-                        continue
-                    seen_sent.add(sent)
-                    total = pc + self._cost(w) - LONG_SPAN_BOOST * 0.5 + sc
-                    out.append((sent, total, m))
-                if len(out) >= n:
-                    return out
+                if L == 4:
+                    # span4 也设词频门槛：4 音节键串候选稀少，top1 常是
+                    # 「小吃小喝(1889)/通讯程序(1725)/误尽天下(1006)」类
+                    # 低频怪词——它们占锚产出纯垃圾句；真锚西湖醋鱼(3607)/
+                    # 测试一下(14305)/那个东西(9620) 全部过线（2026-09-05 实测）
+                    if self.de.weight(lst[0][1]) >= ANCHOR2_FREQ:
+                        cores.append((i, i + L, lst[0][1]))
+                else:
+                    # 口语序去重取前 6：底库 rank 是书面语料的序（xi 组
+                    # 想吃 rank11 被消除/县城/薪酬压制），口语 zipf 序里
+                    # 想吃升到第 5——按口语频排序后再取（2026-09-05 实测）
+                    uniq, seen_w = [], set()
+                    for _, w in lst:
+                        if w in seen_w:
+                            continue
+                        seen_w.add(w)
+                        uniq.append(w)
+                        if len(uniq) >= 32:
+                            break
+                    uniq.sort(key=lambda w: -self._spoken(w))
+                    for w in uniq[:6]:
+                        if self.de.weight(w) >= ANCHOR2_FREQ:
+                            cores.append((i, i + L, w))
+        if not cores:
+            return []
+        # 长锚优先、同长口语频优先——真锚先被轮询（东西 zipf>大学/大型，
+        # 想吃 zipf 升 xi 组第 5，见 docstring 与 _spoken 注释）
+        cores.sort(key=lambda a: (-(a[1] - a[0]), -self._spoken(a[2]), a[0]))
+        # ---- 每个锚为核心：前缀 viterbi top1 + 本锚 + 右侧就近串接 ----
+        out, seen_sent, seen_core, seen_prefix = [], set(), set(), set()
+        for (ai, aj, aw) in cores:
+            if aw in seen_core:
+                continue
+            seen_core.add(aw)
+            pres = self.viterbi(keys[:ai], mode, 1, ret_cost=True, prev=prev) \
+                if ai else [("", 0.0, 0)]
+            if not pres:
+                continue
+            # 同前缀去重：核心=查询缓存/出现/重新……系列共享同一 viterbi
+            # 前缀（文件他想…），8 个垃圾变体占满候选池把真句挤到 13 名
+            # 外（2026-09-05 实测）。前缀是骨架，同骨架留口语频最高的核心
+            # 即可——核心已按口语序轮询，先到先得。
+            pk = pres[0][0]
+            if pk and pk in seen_prefix:
+                continue
+            if pk:
+                seen_prefix.add(pk)
+            # 词链（不拼串）：同起点并列的选择统计信号全线失效——weight 压
+            # （想吃 rank11）、衔接字级共现噪声压（(天,宣)=31「今天宣传」、
+            # (天,选)「天选」压 (天,想)=6）。**只有神经终审能裁**：
+            # 高口语频核心（zipf≥5.4，今天/东西类）的同起点锚**全部展开**
+            # 进池（8 句里多句垃圾可接受）；普通核心维持双支控池规模
+            # （2026-09-05 实测钉死）。
+            head = ([pres[0][0]] if pres[0][0] else []) + [aw]
+            total = pres[0][1] + self._cost(aw) - LONG_SPAN_BOOST * 0.5
+            # hot 口径=口语频次绝对值（v3 表是真实频次）：5000 次以上才是
+            # 今天(61308)/东西(38127) 级高频核心；阈值 540（旧 zipf 口径）
+            # 会让「集团/我就/我叫」类中等词也全展开，垃圾句挤爆候选池
+            hot_core = self._spoken(aw) >= 5000
+            fork_cap = 8 if hot_core else 2
+            made_cap = fork_cap
+            # FIFO 队列：先分叉的链先出句——LIFO 会让 branch-of-branch
+            # 抢在前头耗尽每核心配额，正主（想吃支）饿死（实测钉死）
+            queue = [(aj, head, fork_cap)]
+            made = 0
+            while queue and made < made_cap and len(out) < n:
+                pos, words, forks = queue.pop(0)
+                while True:
+                    ahead = [a for a in cores if a[0] >= pos]
+                    if not ahead:
+                        gap = self.viterbi(keys[pos:], mode, 1)
+                        if gap and gap[0]:
+                            words = words + [gap[0]]
+                        sent = "".join(words)
+                        if sent not in seen_sent:
+                            seen_sent.add(sent)
+                            out.append((sent, total, m))
+                            made += 1
+                        break
+                    nmin = min(a[0] for a in ahead)  # 就近优先
+                    same = [a for a in ahead if a[0] == nmin]
+                    last = words[-1] if words else ""
+                    s4 = [a for a in same if a[1] - a[0] >= 3]
+                    s4.sort(key=lambda a: -self.de.weight(a[2]))
+                    r2 = [a for a in same if a[1] - a[0] < 3]
+                    r2.sort(key=lambda a: (-self._bi_bonus_span(last, a[2]),
+                                           -self.de.weight(a[2])))
+                    main = s4[0] if s4 else (r2[0] if r2 else None)
+                    if main is None:
+                        break
+
+                    def _adv(nxt, wds, fk, cur_pos=pos):
+                        gw = []
+                        if nxt[0] > cur_pos:
+                            gap = self.viterbi(keys[cur_pos:nxt[0]], mode, 1)
+                            if gap and gap[0]:
+                                gw = [gap[0]]
+                        return (nxt[1], wds + gw + [nxt[2]], fk)
+
+                    branch = None
+                    if forks > 0:
+                        if hot_core and s4:
+                            # 高频核心：span4 主链之外，span2 组也全展开
+                            branches = [a for a in r2 if a is not main][:forks]
+                        else:
+                            alt = r2 if s4 else r2[1:]
+                            # 双支：口语组合词（想吃 3509 vs 想出 3523）频次
+                            # 差距可小到 14 次，单支必被同衔接对手抢掉
+                            branches = alt[:2]
+                        if branches:
+                            branch = branches
+                    if branch:
+                        forks -= 1
+                        for b in branch:
+                            queue.append(_adv(b, words, forks))
+                    pos, words, forks = _adv(main, words, forks)
+                    # 主链原地继续推进；副链在栈中稍后处理
+            if len(out) >= n:
+                break
         return out
 
     def _viterbi_raw(self, keys, mode, n, ret_cost=False, prev=""):

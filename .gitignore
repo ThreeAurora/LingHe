@@ -9,3 +9,9 @@ cache/tmp/corpus/opensub_raw.zip
 
 # 神经模型权重（114MB，fetch_model.py 从 hf-mirror 再生，不入库）
 ai_neural/**/*.onnx
+
+# LLM 模型权重（~1.5GB，fetch_qwen.py 从 hf-mirror 再生，不入库）
+ai_llm/qwen25-05b-hf/
+ai_llm/*.gguf
+ai_llm/llama/
+ai_llm/llama-cpu.zip
