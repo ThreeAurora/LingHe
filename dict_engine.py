@@ -365,7 +365,12 @@ class DictEngine:
         打了半年的常用词重启后顺序全部回到解放前，记忆功能实质失效。改为全部
         落盘，但走脏表批量写（每 30 次上屏或 flush() 时合并一次），不碰每次
         上屏的关键路径。
+
+        只记纯中文词（英文/混合串一律拒收——主人明令：不记录英文；
+        2026-09-05 起底层闸门，所有调用点统一生效）。
         """
+        if not word or not all("\u4e00" <= ch <= "\u9fff" for ch in word):
+            return
         with self._lock:
             c = self.user_counts.get(word, 0) + 1
             self.user_counts[word] = c

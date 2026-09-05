@@ -35,6 +35,11 @@ import math
 import os
 import threading
 
+
+def _is_cjk(word):
+    """纯中文词判定（英文/混合串一律 False）。"""
+    return bool(word) and all("\u4e00" <= ch <= "\u9fff" for ch in word)
+
 # ---- 模型参数（由 tune.py 在真实用例上扫参得到，改动前先跑 tune.py）----
 # 当前组合 L=12 / P=4 在 10 个整句用例上 top1 命中 9/10（唯一失手的是简拼
 # wilygbz，见文件末尾说明）。
@@ -59,6 +64,11 @@ BEAM = 16       # Viterbi beam 宽度。6 会被 2 字词占满：1+1 单字对�
                 # 就被挤出 beam（ilygbz 案）。16 让 前缀|一个 这类「先吃强共现
                 # 红利」的路径活到中段；代价=长码 viterbi ~15ms（有缓存，可接受）。
 MAX_SPAN = 4    # 一个词最多横跨几个音节
+LONG_SPAN_BOOST = 8.0   # 长跨度（3~4音节）top3 温和奖励。注意只是微调：曾试
+                        # 12/24/32 想把西湖醋鱼顶进 beam，全部失败且引发军备
+                        # 竞赛（「后槽牙/会采用」都是 hcy 的 top3，竞争句叠
+                        # 双 boost 反超）——统计 beam 装不下口语专名串是零和
+                        # 死局，正解是 anchor_sentences 锚定通道 + 神经裁决。
 SPAN_CANDS = 48  # 每个跨度召回多少候选（去重前）。8 太窄：高频词（如「现在」之于 xz）
                  # 会被同键位的低频词挤出 span，整句从第一个词就错（xzdwtu 案）。
                  # 24 也不够：by_initial 带重复词条且单字池极深（吃 在 ch-单字里
@@ -137,8 +147,14 @@ class StatReranker:
             pass
 
     def learn(self, prev_word, word):
-        """用户上屏时调用：记住「上一个词 -> 这个词」的共现。"""
+        """用户上屏时调用：记住「上一个词 -> 这个词」的共现。
+
+        只学中文词——英文/混合串进共现表会污染联想与上文衰减
+        （主人明令：不记录英文）。
+        """
         if not prev_word or not word or prev_word == word:
+            return
+        if not (_is_cjk(prev_word) and _is_cjk(word)):
             return
         with self._lock:
             k = (prev_word, word)
@@ -360,6 +376,63 @@ class StatReranker:
         self._viterbi_cache[ck] = out
         return out
 
+    def anchor_sentences(self, keys, mode="ini", n=6, prev=""):
+        """长词锚定召回：3~4 音节键串的 top1 命中词，强制构造整句进池。
+
+        背景（2026-09-05 主人 wjtxixhcy 用例）：主 beam 的统计代价系统性
+        偏向「新车型|后槽牙」类词典可命中长词链——每字 -15.6，把「我今天
+        想吃西湖醋鱼」这类口语串全程剪枝；给长词加 boost 又引发军备竞赛
+        （3 音节键串候选少，top3 门槛形同虚设）。锚定通道绕开零和竞争：
+        对每个 3~4 音节跨度，取该键串的 top1 词做锚，前缀/后缀用常规
+        viterbi 最优路径填充，整句直进候选池——检索便宜、裁决全面，排序
+        交给神经层（「我今天想吃西湖醋鱼」的 MLM 通顺度完爆荒谬长词链）。
+
+        返回 [(句子, 代价, 音节数)]，代价是粗粒度拼接值（接缝 bigram 不算），
+        只用于与整句候选按每字均价比价，精度要求不高。
+        """
+        m = len(keys)
+        if m < 4:
+            return []
+        out, seen_anchor, seen_sent = [], set(), set()
+        for i in range(0, m - 2):
+            for j in (i + 3, i + 4):
+                if j > m:
+                    continue
+                key_str = " ".join(keys[i:j])
+                lst = self.de.by_pinyin.get(key_str) if mode == "py" \
+                    else self.de.by_initial.get(key_str)
+                if not lst:
+                    continue
+                w = lst[0][1]
+                if w in seen_anchor:
+                    continue
+                # 锚点门槛：4 字词必锚（4 音节键串候选天然稀少，rank1 就是
+                # 用户想要的）；3 字词只在该键串候选极少数时锚——否则「和
+                # 参与/小吃下」这类 3 字词占满锚点，真锚（西湖醋鱼）轮不到。
+                if len(w) < 4 and len(lst) > 8:
+                    continue
+                seen_anchor.add(w)
+                pres = self.viterbi(keys[:i], mode, 3, ret_cost=True,
+                                    prev=prev) if i else [("", 0.0, 0)]
+                sufs = self.viterbi(keys[j:], mode, 1, ret_cost=True) if j < m \
+                    else [("", 0.0, 0)]
+                if not pres or not sufs:
+                    continue
+                ss, sc, _ = sufs[0]
+                # 前缀出 top3 变体：前缀的统计代价被「文件体现」类 4 字词条
+                # （L×3 奖励）垄断，「我今天想吃」这类口语前缀排不进 top1，
+                # 但它的 MLM 通顺度完爆——多路进池，排序交给神经裁决。
+                for ps, pc, _ in pres:
+                    sent = ps + w + ss
+                    if sent in seen_sent:
+                        continue
+                    seen_sent.add(sent)
+                    total = pc + self._cost(w) - LONG_SPAN_BOOST * 0.5 + sc
+                    out.append((sent, total, m))
+                if len(out) >= n:
+                    return out
+        return out
+
     def _viterbi_raw(self, keys, mode, n, ret_cost=False, prev=""):
         m = len(keys)
         # dp[j] = [(cost, words_tuple, last_word), ...] 保留 BEAM 条最优
@@ -388,8 +461,25 @@ class StatReranker:
                 words_here = self._span_cands(keys[i:j], mode, SPAN_CANDS)
                 if not words_here:
                     continue
+                # 长跨度精准命中奖励：3~4 音节键串的 top3 命中是强信号——
+                # 键串特异性高（x h c y 全库仅 5 个候选，西湖醋鱼 rank1），
+                # 用户打出这种串就是冲着这个词来的。低频长词的 unigram 打
+                # 不过高频单字链（西湖+醋+鱼 -52 vs 西湖醋鱼 -44.5），不
+                # boost 的话口语专名串永远在 beam 外（2026-09-05 主人
+                # wjtxixhcy 用例）。2 音节键串候选数百计，rank3 证据弱，
+                # 不 boost。
+                boost = 0.0
+                span_len = j - i
+                if span_len >= 3:
+                    key_str = " ".join(keys[i:j])
+                    lst = self.de.by_pinyin.get(key_str) if mode == "py" \
+                        else self.de.by_initial.get(key_str)
+                    if lst:
+                        top3 = {w for _, w in lst[:3]}
+                else:
+                    top3 = ()
                 for w in words_here:
-                    cw = cost_of(w)
+                    cw = cost_of(w) - (LONG_SPAN_BOOST if w in top3 else 0.0)
                     for c0, seq, prev in prev_states:
                         cand.append((c0 + cw - self._bi_bonus_span(prev, w), seq + (w,), w))
             if not cand:
