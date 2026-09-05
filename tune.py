@@ -29,6 +29,11 @@ import rerank  # noqa: E402
 # 用例：(音节序列, 模式, 期望结果)。期望结果以底库实际收录为准。
 CASES = [
     (list("wilygbz"), "ini", "我吃了一个包子"),
+    # 主人实测提的三个简拼用例（2026-09-05）——简拼一键=整个声母，歧义极重，
+    # 这三个是「冷启动整句」的试金石，务必保持在内，别让调参把它们优化没了。
+    (list("ilygbz"), "ini", "吃了一个包子"),
+    (list("hubgvn"), "ini", "还是不够智能"),
+    (list("hutil"), "ini", "还是太差了"),
     ("zhan mu si".split(), "py", "詹姆斯"),
     ("wo shi zhong guo ren".split(), "py", "我是中国人"),
     ("ni hao".split(), "py", "你好"),
@@ -76,23 +81,27 @@ def main():
         return
 
     best = None
-    print("扫参中（%d 组 x %d 用例）..." % (6 * 5, len(CASES)))
-    for L in (0.0, 3.0, 6.0, 9.0, 12.0):
-        for P in (0.0, 2.0, 4.0, 6.0, 8.0, 10.0):
-            rerank.L, rerank.P = L, P
+    print("扫参中（B_PRE x B_PRE_CHAR = %d 组 x %d 用例，L=12 P=4）..." % (3 * 3, len(CASES)))
+    # B_PRE 也要扫（2026-09-05）：短语挖矿 + 字级微开后，(了,一个)=395 这类
+    # 强文本对的权重决定 词级跨度路径 能否压过 虚词对助推的 竞争路径。
+    for BP in (1.5, 2.0, 2.5):
+        for BPC in (0.0, 0.4, 0.8):
+            rerank.B_PRE, rerank.B_PRE_CHAR = BP, BPC
             rr._viterbi_cache.clear()
             s1 = score(rr, 1)
             s3 = score(rr, 3)
-            print("  L=%-5.1f P=%-5.1f  top1=%2d/%d  top3=%2d/%d"
-                  % (L, P, s1, len(CASES), s3, len(CASES)))
-            key = (s1, s3, -abs(P - 4.0))  # 同分时取 P 接近 4 的（更平滑）
+            print("  B_PRE=%-4.1f B_PRE_CHAR=%-4.1f  top1=%2d/%d  top3=%2d/%d"
+                  % (BP, BPC, s1, len(CASES), s3, len(CASES)))
+            # 同分时取 B_PRE 小的（预训练只是先验，不宜压过用户证据）
+            key = (s1, s3, -BP)
             if best is None or key > best[0]:
-                best = (key, (L, P), s1, s3)
-    (_, (L, P), s1, s3) = best
-    print("\n最优：L=%.1f  P=%.1f   (top1 %d/%d, top3 %d/%d)" % (L, P, s1, len(CASES), s3, len(CASES)))
-    print("把这两个值写回 rerank.py 的 L / P。")
+                best = (key, (BP, BPC), s1, s3)
+    (_, (BP, BPC), s1, s3) = best
+    print("\n最优：B_PRE=%.1f  B_PRE_CHAR=%.1f   (top1 %d/%d, top3 %d/%d)"
+          % (BP, BPC, s1, len(CASES), s3, len(CASES)))
+    print("把这两个值写回 rerank.py 的 B_PRE / B_PRE_CHAR。")
 
-    rerank.L, rerank.P = L, P
+    rerank.B_PRE, rerank.B_PRE_CHAR = BP, BPC
     rr._viterbi_cache.clear()
     print("\n===== 最优参数下的逐用例结果 =====")
     for keys, mode, want in CASES:

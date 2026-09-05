@@ -31,6 +31,7 @@ from fuma import FuMa
 from mabiao import MaBiao
 from rerank import StatReranker
 from xiaohe import decode_syllable
+import caret_ctx
 import parser as key_parser
 
 # ---------------- WinAPI ----------------
@@ -203,7 +204,10 @@ class Engine:
         self._cache_code = None      # compute 结果缓存（同码串复用）
         self._cache_cands = None
         self._cache_nmb = 0
-        self.liaison = None          # 上屏联想词（豆包式：上屏后提示下一词，空格直上）
+        self._cache_ctx = ""         # 缓存对应的上文（同码不同上文须重算）
+        self.liaison = None          # 上屏联想词列表（豆包式：上屏后提示后续词）
+        self.ctx_prevs = []          # 光标处上文词列表（tail_words 切出，最近在前；
+                                     # 豆包「指哪打哪」：多上文衰减打分的输入）
 
         self.ai = AIEngine(cfg.get("ai", {}), log=log)
         self.ai.on_result = lambda seq: self.q.put(("ai", seq))
@@ -245,8 +249,13 @@ class Engine:
             ss = "".join(syls)
             cands = list(self.mb.exact(ss)) if len(ss) <= 4 else []
             if self.de.loaded and len(syls) <= 4:
-                # 底库同拼音词一并进入辅码筛选池
-                cands += self.de.lookup_pinyin(" ".join(syls), 30)
+                # 底库同拼音词一并进入辅码筛选池。
+                # 坑：syls 是**双拼键**（yi/dv），而底库 by_pinyin 索引是**全拼**
+                # （yi dui），必须先 decode_syllable 转换。直接 join 会得到
+                # "yi dv"，永远查不到任何词——「辅码作用于 152 万底库词」会静默
+                # 失效，退化成只筛码表内的词（yidvg→一堆 案：码表只有 已对/乙队）。
+                py = " ".join(decode_syllable(s) for s in syls)
+                cands += self.de.lookup_pinyin(py, 30)
             for w in cands:
                 if len(w) != len(syls) or w in seen:
                     continue
@@ -268,50 +277,73 @@ class Engine:
         return out
 
     def compute(self, code):
-        """候选装配（返回候选池，供翻页）：
-        辅码筛选 → 码表(固频) → 底库词(动态调频:重排) → 整句切分 → AI 顺延。
-        主码表是固频永不重排（主人约定）；底库是动态调频侧。
-        同码串连续调用直接命中缓存（翻页/选字/AI 回包都不再重算）。"""
-        if code == self._cache_code and self._cache_cands is not None:
+        """候选装配（返回候选池，供翻页）。主人定约（2026-09-05）：
+
+        1. 码表固频（辅码筛选 + 全码 exact + 前缀简码）永远在最前——肌肉记忆；
+        2. 其后**任意码长**（1/2/3/4/5...）都是「底库词 + Viterbi 整句」同池，
+           按「每音节平均代价」统一比价智能排序——词库里没有的组合，只要
+           统计上最该出现就排前面（ibz→吃包子 案：整句「吃|包子」与词条
+           「吃包子」同池竞争，谁代价小谁在前）；
+        3. 同码串连续调用直接命中缓存（翻页/选字/AI 回包都不再重算）。
+        """
+        if code == self._cache_code and tuple(self.ctx_prevs) == self._cache_ctx \
+                and self._cache_cands is not None:
             return self._cache_cands, self._cache_nmb
         n = len(code)
         fused = self._fused_candidates(code)
         mb_exact = list(self.mb.exact(code))
         seen = set(fused) | set(mb_exact)
         mb_hits = fused + mb_exact
+        mb_prefix = []
         for w in self.mb.prefix(code, self.n_pool * 2):
             if w not in seen:
-                mb_hits.append(w)
+                mb_prefix.append(w)
                 seen.add(w)
-        # 底库（动态调频侧）：先词后句。词进统计重排；整句切分单独一层跟在词后。
-        dict_words, sentences = [], []
+        # ---- 同池：底库词 + 整句，统一「每音节平均代价」度量 ----
+        # 词的代价由 rerank.score_word 给出（unigram+用户+多上文），除以音节数；
+        # 整句代价由 Viterbi 返回（已含词间 bigram），除以音节数。两者同参数
+        # 同上下文，可直接比较——这是「智能排序」与「词句公平竞争」的核心。
+        # 多上文：[一个, 吃了] 这样的尾部词列表交给 score_word 衰减打分，
+        # Viterbi 首词仍只挂最近词（整句内部词序自带 bigram）。
+        prevs = self.ctx_prevs or ([self.last_word] if self.last_word else [])
+        prev = prevs[0] if prevs else ""
+        pool = {}
         if self.de.loaded:
+            dict_cands = []
             if n >= 2 and n % 2 == 0:
                 py = " ".join(decode_syllable(code[i:i + 2]) for i in range(0, n, 2))
-                dict_words += self.de.lookup_pinyin(py, self.n_pool)
-            if n >= 3 and not mb_exact and not self.mb.prefix(code, 1):
-                dict_words += self.de.lookup_initial(" ".join(code), self.n_pool)
-            dw = []
-            for w in dict_words:  # 池内去重（全拼路/简拼路可能命中同一个词）
-                if w not in seen:
-                    seen.add(w)
-                    dw.append(w)
-            dict_words = self.rr.rerank(dw, self.last_word)
-            if n > 4:
-                # 第 5 码起整句切分：全拼/简拼两路并跑，按「每字平均代价」合并——
-                # 两路代价不可直接比较（词数不同），每字均值语义一致。
-                pool = []
-                if n % 2 == 0:
-                    keys = [decode_syllable(code[i:i + 2]) for i in range(0, n, 2)]
-                    pool += self.rr.viterbi(keys, "py", 5, ret_cost=True)
-                pool += self.rr.viterbi(list(code), "ini", 5, ret_cost=True)
-                pool.sort(key=lambda t: t[1] / max(1, t[2]))
-                for s, _c, _m in pool:
-                    if s not in seen and s not in sentences:
-                        sentences.append(s)
-        base = mb_hits + dict_words + sentences
+                dict_cands += self.de.lookup_pinyin(py, self.n_pool)
+            if n >= 2 and not mb_exact:
+                # 简拼召回放宽到 2 键：bz→包子、mb→面包 是最高频场景，
+                # 之前 n>=3 把它们全部挡在召回之外。2 键另需更深召回：
+                # by_initial['b z'] 里 豹子 排 78（470 条含重复），默认
+                # n_pool=45 的截断把它挡在池外（主人 追上了一个bz→豹子 案）。
+                dict_cands += self.de.lookup_initial(" ".join(code),
+                                                     90 if n == 2 else self.n_pool)
+            for w in dict_cands:
+                if w in seen or w in pool:
+                    continue
+                pym = self.de.word_py.get(w) or ""
+                m = max(1, len(pym.split()))
+                pool[w] = self.rr.score_word(w, prevs) / m
+        if n >= 2:
+            # 整句切分放开到任意码长：短码也要能预测词库外组合
+            vpool = []
+            if n % 2 == 0 and n >= 4:
+                keys = [decode_syllable(code[i:i + 2]) for i in range(0, n, 2)]
+                vpool += self.rr.viterbi(keys, "py", 5, ret_cost=True, prev=prev)
+            vpool += self.rr.viterbi(list(code), "ini", 5, ret_cost=True, prev=prev)
+            vpool.sort(key=lambda t: t[1] / max(1, t[2]))
+            for s, c, m in vpool:
+                if s in seen:
+                    continue
+                cps = c / max(1, m)
+                if s not in pool or cps < pool[s]:
+                    pool[s] = cps  # 同串取更优代价（词条 vs 切分谁准谁上）
+        dict_side = [w for w, _ in sorted(pool.items(), key=lambda kv: kv[1])][: self.n_pool]
+        base = mb_hits + mb_prefix + dict_side
         base = base[: self.n_pool]
-        n_mb = len(mb_hits)
+        n_mb = len(mb_hits) + len(mb_prefix)
         # AI 顺延：静态侧命中 k 个，AI 从第 k+1 位起
         merged = base[:]
         for w in self.ai.peek(self.context_key(), code):
@@ -319,6 +351,7 @@ class Engine:
                 merged.append(w)
         merged = merged[: self.n_pool]
         self._cache_code = code
+        self._cache_ctx = tuple(self.ctx_prevs)  # 上文变了结果必须重算（同码不同上文）
         self._cache_cands = merged
         self._cache_nmb = n_mb
         return merged, n_mb
@@ -394,14 +427,16 @@ class Engine:
         if fg != self.last_fg:
             self.last_fg = fg
             self.context.clear()  # 换窗口=换语境
+            self.ctx_prevs = []   # 上下文也随窗口失效
             self.liaison = None
             self.q.put(("hide",))
 
         if not self.cn_mode:  # 英文态：全部透传
             return user32.CallNextHookEx(None, ncode, wparam, lparam)
 
-        # 联想词生命周期：只被空格消费，其他任何键都取消
-        if self.liaison and vk != VK_SPACE:
+        # 联想词生命周期：被空格（上屏首选）或数字（选第 n 个）消费，
+        # 其他任何键都取消。数字键不放行到这里，否则联想会被提前清掉。
+        if self.liaison and vk != VK_SPACE and not is_digit:
             self.liaison = None
             if not self.buffer:
                 self.q.put(("hide",))
@@ -412,6 +447,17 @@ class Engine:
                     self.buffer = ""
                     self.q.put(("hide",))
                 return user32.CallNextHookEx(None, ncode, wparam, lparam)
+            if not self.buffer:
+                # 新码开始：读一次光标处上下文（每组码只读一次，摊薄开销）。
+                # 这是豆包「指哪打哪」的关键——同样的键串在不同上文下应出不同
+                # 结果。tail_words 切出最后 3 个词（限长 2 保住动词），供
+                # 多上文衰减打分；同码不同上文会触发重算（缓存键含上文）。
+                try:
+                    before, _after = caret_ctx.read_context(before=64, after=0)
+                    self.ctx_prevs = caret_ctx.tail_words(
+                        before, self.de.word_py if self.de.loaded else None, 3)
+                except Exception:
+                    self.ctx_prevs = []
             if len(self.buffer) < self.max_len:
                 self.buffer += chr(vk).lower()
             # 第 5 码起继续组码（纯双拼续词）；超 max_len 后吞键防漏字母
@@ -427,15 +473,15 @@ class Engine:
 
         if vk == VK_SPACE:
             if self.buffer:
-                cands, _ = self.compute(self.buffer)
+                cands, n_mb = self.compute(self.buffer)
                 if cands:
-                    self._commit(cands[0])
+                    self._commit(cands[0], 0, n_mb)
                 else:
                     self.buffer = ""
                     self.q.put(("hide",))
                 return self._eat()
-            if self.liaison:  # 联想态：空格直接上屏联想词（并继续联想下一词）
-                w = self.liaison
+            if self.liaison:  # 联想态：空格上屏首选联想词（并继续联想下一词）
+                w = self.liaison[0]
                 self.liaison = None
                 if self.de.loaded:
                     self.de.remember(w, self.de.word_py.get(w, ""))  # 联想上屏也调频
@@ -443,12 +489,23 @@ class Engine:
                 return self._eat()
             return user32.CallNextHookEx(None, ncode, wparam, lparam)
 
+        if is_digit and not self.buffer and self.liaison:
+            # 联想态下数字键 = 选第 n 个联想词（豆包式），同样调频并续联想
+            idx = vk - 0x31
+            if 0 <= idx < len(self.liaison):
+                w = self.liaison[idx]
+                self.liaison = None
+                if self.de.loaded:
+                    self.de.remember(w, self.de.word_py.get(w, ""))
+                self._commit(w)
+                return self._eat()
+
         if is_digit and self.buffer:
             idx = vk - 0x31
-            cands, _ = self.compute(self.buffer)
+            cands, n_mb = self.compute(self.buffer)
             idx += self.page * self.n_show  # 数字选字作用于当前页
             if idx < len(cands):
-                self._commit(cands[idx])
+                self._commit(cands[idx], idx, n_mb)
             return self._eat()
 
         # 翻页：=/Tab 下一页（末页回卷），- 上一页；无组码时透传
@@ -464,10 +521,10 @@ class Engine:
         if vk in (VK_OEM_1, VK_OEM_7) and self.buffer:
             # 分号=2选，单引号=3选（音形重码选择键惯例，作用于当前页）
             idx = 1 if vk == VK_OEM_1 else 2
-            cands, _ = self.compute(self.buffer)
+            cands, n_mb = self.compute(self.buffer)
             idx += self.page * self.n_show
             if len(cands) > idx:
-                self._commit(cands[idx])
+                self._commit(cands[idx], idx, n_mb)
             return self._eat()  # 无对应候选时吞键忽略，;/' 不漏进目标窗口
 
         if vk == VK_ESCAPE and self.buffer:
@@ -485,9 +542,9 @@ class Engine:
             return self._eat()
 
         if self.buffer and vk in PUNCT_VKS:
-            cands, _ = self.compute(self.buffer)
+            cands, n_mb = self.compute(self.buffer)
             if cands:  # 组码中标点：上屏首选，随后标点照常进应用
-                self._commit(cands[0])
+                self._commit(cands[0], 0, n_mb)
             return user32.CallNextHookEx(None, ncode, wparam, lparam)
 
         if self.buffer:
@@ -516,10 +573,20 @@ class Engine:
         if len(self.buffer) > 4 and self.cfg.get("ai", {}).get("enabled", True):
             self.ai.request(self.buffer, "".join(self.context))
 
-    def _commit(self, word):
+    def _commit(self, word, sel_idx=None, n_mb=0):
+        """上屏一个词。
+
+        sel_idx/n_mb：从候选池第 sel_idx 位选中、其中前 n_mb 位是码表固频。
+        码表固频区的选中**不做底库调频**（remember）——码表字（吧/做/在 这类）
+        的 user_count 是肌肉记忆的副产品，写进用户词库既无排序收益（固频永远
+        在前），又会通过 rerank 的 unigram/个性化通道污染统计层。
+        bigram 学习（rr.learn）保留： 了→在 这类真实接龙对联想有价值。
+        """
         # 自动记忆/调频：偶数长码可还原拼音串，音节合法才入 user_dict
         py = None
-        if self.de.loaded and len(self.buffer) >= 2 and len(self.buffer) % 2 == 0:
+        from_mabiao = sel_idx is not None and sel_idx < n_mb
+        if self.de.loaded and not from_mabiao and len(self.buffer) >= 2 \
+                and len(self.buffer) % 2 == 0:
             syls = [decode_syllable(self.buffer[i:i + 2]) for i in range(0, len(self.buffer), 2)]
             cand = " ".join(syls)
             if all(s in self.de.valid_sylls for s in syls):
@@ -531,16 +598,27 @@ class Engine:
         self.stats["commits"] += 1
         # bigram 学习：上一个上屏词 → 本词（越用越准的来源）
         self.rr.learn(self.last_word, word)
+        # 多上文学习：尾部各位置的词 → 本词（位置信息由读取端的衰减处理）。
+        # 这是「打碎了一个 bz→杯子」的第二次必中机制：第一次没有动宾统计
+        # 证据排不到前面，用户翻页选了杯子，此处的 (打碎,杯子) 用户共现
+        # （B=4，强于一切预训练证据）让它下次直接冲到前排。
+        for p in self.ctx_prevs:
+            if p and p != word:
+                self.rr.learn(p, word)
         self.last_word = word
+        # 上屏后光标前的尾部词 = 本词 + 原上文前两个（多上文滚动的近似，
+        # 免去再读一次屏幕）
+        self.ctx_prevs = [word] + self.ctx_prevs[:2]
         if py:
             self.de.remember(word, py)  # 新词入库/旧词调频，批量落盘
         send_unicode(word)  # 注入事件自带 INJECTED 标志，会被钩子放行
-        # 上屏联想（豆包式）：提示下一个可能的词，空格直接上屏
+        # 上屏联想（豆包式）：提示后面可能的词，空格上屏首选，数字键选其余
         self.liaison = None
         if self.cfg.get("liaison", True):
-            nxt = self.rr.next_word(word, 1)
+            n = int(self.cfg.get("liaison_count", 6))
+            nxt = self.rr.next_word(word, n)
             if nxt:
-                self.liaison = nxt[0]
+                self.liaison = nxt
                 self.q.put(("liaison", word, self.liaison, caret_pos()))
 
     # ---- 安装/卸载 ----
@@ -613,10 +691,11 @@ def main():
                     ui.flash(text, last_pos)
                     root.after(900, ui.hide)
                 elif kind == "liaison":
-                    # 上屏联想：候选窗显示 [已上屏词 + 联想词]，空格即上屏联想词
+                    # 上屏联想：候选窗显示 [已上屏词 + 联想词列表]，
+                    # 空格=上屏首选，数字键=选第 n 个联想
                     _, prev, nxt, pos = item
                     last_pos = pos
-                    ui.update(prev, [(nxt, True)], pos)
+                    ui.update(prev, [(w, i == 0) for i, w in enumerate(nxt)], pos)
                 elif kind == "ai":
                     # AI 结果返回：失效缓存后重算（把 AI 候选并入），按当前页显示
                     if eng.buffer:

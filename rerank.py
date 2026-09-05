@@ -44,13 +44,26 @@ P = 4.0      # 单字惩罚
 U = 3.0      # 用户个性化权重
 B = 4.0      # 上下文 bigram 权重（用户在线学习）
 B_PRE = 1.5    # 预训练词级共现权重（弱于用户证据，只做平票裁决，与用户取 max 不叠加）
-B_PRE_CHAR = 0.0  # 预训练字级共现：实测弊大于利（中性字对太多无区分度，10 例 9→8），默认禁用；
-                  # 表仍在 cooc_pre.bin 里，如需启用调成 0.8~1.2
+B_PRE_CHAR = 0.4  # 预训练字级共现（微开）。2026-09-05 复扫：P 扫参下 0.4 与 0.0 同为
+                  # 9/13，但 0.4 让 (吃,了)=74 这类词表缺失的字级连接进场
+                  # （(吃,包子) 词级对已由短语挖矿补上，字级只管 词干+助词）。
+                  # 0.8 以上仍净伤害；换现代口语语料后再重扫。
 UNK_LOG = 1.4  # 未登录词（底库无词频）的默认 log 频
 
-BEAM = 6        # Viterbi beam 宽度
+DECAY = 0.5    # 多上文衰减：第 i 个上文词的 bonus 乘 DECAY^i。
+               # 0.5 = 紧邻全额、隔一词 1/2、隔两词 1/4——「我吃了一个」里
+               # 动词「吃」在两个词之外，靠这个通道参与裁决（bz→包子 案）。
+
+BEAM = 16       # Viterbi beam 宽度。6 会被 2 字词占满：1+1 单字对（吃|了 -21.4）
+                # 系统性比 2 字词（成立 -25.9）贵 ~4 nat，整句需要的词根在 j=2
+                # 就被挤出 beam（ilygbz 案）。16 让 前缀|一个 这类「先吃强共现
+                # 红利」的路径活到中段；代价=长码 viterbi ~15ms（有缓存，可接受）。
 MAX_SPAN = 4    # 一个词最多横跨几个音节
-SPAN_CANDS = 8  # 每个跨度召回多少候选
+SPAN_CANDS = 48  # 每个跨度召回多少候选（去重前）。8 太窄：高频词（如「现在」之于 xz）
+                 # 会被同键位的低频词挤出 span，整句从第一个词就错（xzdwtu 案）。
+                 # 24 也不够：by_initial 带重复词条且单字池极深（吃 在 ch-单字里
+                 # 排 109），24 会把整句需要的动词第一个音节就漏掉（ilygbz 案），
+                 # 48+去重后 覆盖到唯一排名 ~70。
 MAX_KEYS = 16   # 整句最多处理多少音节（安全上限）
 
 
@@ -174,69 +187,162 @@ class StatReranker:
     def _cost(self, word):
         """单个词的 unigram 代价（越小越优）。"""
         w = self.de.weight(word)
-        c = -A * (math.log(1 + w) if w > 0 else UNK_LOG)
         n = len(word)
+        u = self.de.user_count(word)
+        if w <= 0:
+            # 无词频词条分两档。绝对不能让它们吃到 L 长词奖励：
+            # 「不子」这类死词条（weight=0）按 UNK_LOG=1.4 计频再吃 L=12，
+            # 代价 -13.4 反超真词 豹子（-21.8），霸占简拼候选前排。
+            if u:
+                return -UNK_LOG - U * math.log(1 + u)  # 用户自造词：使用次数当频
+            return -UNK_LOG + 6.0                      # 纯垃圾占位：全场最差
+        c = -A * math.log(1 + w)
         if n > 1:
             c -= L * (n - 1)
         else:
             c += P
-        u = self.de.user_count(word)
-        if u:
+        # 个性化只作用于多字词。单字的 user_count 来自码表固频上屏（吧=3、
+        # 做=7 这类），是肌肉记忆的副产品而非词汇偏好——让它进 U 项会把
+        # Viterbi 单字序列的代价压低 ~10 个 nat（吧做 -21.9→-32.1），直接
+        # 碾压真词「包子」(-24.6)，这就是 2 键简拼出「吧做/被做」的根源。
+        # 单字的排序由码表固频负责，统计层不再放大。
+        if n > 1 and u:
             c -= U * math.log(1 + u)
         return c
 
     def _bi_bonus(self, prev, word):
-        """上文加分：用户在线学习（B）、预训练词级（B_PRE）、预训练字级（B_PRE_CHAR）
-        三者取强者，不叠加。
+        """上文加分：**分级回退**（用户 > 预训练词级 > 预训练字级），取第一级
+        命中的证据，不叠加、也不取 max。
 
-        不叠加的原因：预训练语料规模与用户使用量差若干个数量级，线性相加会让
-        预训练永久淹没用户证据；取 max 则用户打过一次的词立刻以更高权重生效。
-        字级（prev 尾字 × word 首字）是词级未覆盖时的泛化兜底。
+        为什么不取 max：字级是「字出现次数」，天然比词级高 1~2 个数量级
+        （实测「了→一」字级 3403 vs 词级 382，「吃→了」字级 74 vs 词级 0）。
+        取 max 会让字级永久淹没词级，中性字对（的/了/是）的噪声被放大到压过
+        真正的词搭配——这就是字级一度被整体禁用的原因。
+
+        为什么用回退：冷启动时大量真实搭配词级未收录（如「吃→了」），
+        字级恰好能补上这类连接。分级回退既保住词级搭配的精确性
+        （词级有证据就用词级，不让字级干扰），又让词级缺失的连接在
+        冷启动时也能生效。
+
+        优先级：用户在线学习（B，最强证据）→ 预训练词级（B_PRE）→
+        预训练字级（B_PRE_CHAR，泛化兜底）。
         """
         if not prev:
             return 0.0
-        bonus = 0.0
         c = self.bigram.get((prev, word), 0)
         if c:
-            bonus = B * math.log(1 + c)
+            return B * math.log(1 + c)
         if self.pre_word:
             c2 = self.pre_word.get((prev, word), 0)
             if c2:
-                bonus = max(bonus, B_PRE * math.log(1 + c2))
-        if self.pre_char:
+                return B_PRE * math.log(1 + c2)
+        if self.pre_char and B_PRE_CHAR > 0:
             c3 = self.pre_char.get((prev[-1], word[0]), 0)
             if c3:
-                bonus = max(bonus, B_PRE_CHAR * math.log(1 + c3))
-        return bonus
+                return B_PRE_CHAR * math.log(1 + c3)
+            # 动词词干泛化：上文是「吃了/喝了」这类 词干+助词 短语时，
+            # 尾字（了）与名词无搭配，证据在首字——(吃,包)=2 这类字级对。
+            c4 = self.pre_char.get((prev[0], word[0]), 0)
+            if c4 and len(prev) > 1:
+                return B_PRE_CHAR * math.log(1 + c4)
+        return 0.0
+
+    def _bi_bonus_multi(self, prevs, word):
+        """多上文衰减打分（豆包「读光标附近整句」的统计近似）。
+
+        prevs: [最近词, 次近词, ...]（caret_ctx.tail_words 切出）。
+        第 i 个上文的 bonus 乘 DECAY^i，跨位置累加；每个位置内部仍走
+        _bi_bonus 的分级回退（用户 > 预训练词级 > 预训练字级）。
+
+        为什么需要多上文：光标前的动词往往不在紧邻位——「我吃了一个」打 bz，
+        紧邻上文是「一个」（量词，对 包子/杯子/豹子 全中性），真正的裁决证据
+        是两个词之外的「吃」。衰减求和让远处的动词以 1/4 强度参与，紧邻的
+        强搭配仍占主导——两层证据各就各位。
+        """
+        if isinstance(prevs, str):
+            prevs = [prevs] if prevs else []
+        total = 0.0
+        for i, prev in enumerate(prevs):
+            if not prev:
+                continue
+            # 动词词干回退：上文是 吃了/追着/写过 这类 词干+助词 时，词级
+            # 共现表里记的是 (吃,包子)（挖自短语 吃包子），不是 (吃了,包子)。
+            # 剥掉助词再查一次，取两形中更强者——否则「我吃了一个」打 bz，
+            # 紧邻的动词证据因为带了个「了」就永远查不到。
+            forms = [prev]
+            if len(prev) > 1 and prev[-1] in "了着过":
+                forms.append(prev[:-1])
+            b = max(self._bi_bonus(p, word) for p in forms)
+            if b:
+                total += b * (DECAY ** i)
+        return total
+
+    def _bi_bonus_span(self, prev, w):
+        """Viterbi 跨度专用上文加分。
+
+        预训练共现只助推**多字词跨度**；单字跨度只认用户在线证据。
+        原因：语料虚词对（一个,不)=13 是真实文本证据，但让任意 z 声母
+        单字（不|子、不|在）借位上位——首字吃了 (一个,不) 的 4.4 nat，
+        后面的字靠着高频字频白嫖整条路径。词级跨度自身有 unigram 证据，
+        虚词对助推整词是合理的；单字跨度则必须用户亲自教过才作数。
+        """
+        if len(w) == 1:
+            c = self.bigram.get((prev, w), 0)
+            return B * math.log(1 + c) if c else 0.0
+        return self._bi_bonus(prev, w)
 
     def rerank(self, cands, prev_word=None):
         """对底库候选按 (unigram + 上文 + 用户习惯) 重排。
 
         注意：只应传入底库候选。码表（mabiao）候选是固频，不参与重排。
+        prev_word 可以是单个词，也可以是 tail_words 切出的多词列表。
         """
         if not cands:
             return []
-        scored = [(self._cost(w) - self._bi_bonus(prev_word, w), i, w)
+        scored = [(self._cost(w) - self._bi_bonus_multi(prev_word, w), i, w)
                   for i, w in enumerate(cands)]
         scored.sort()
         return [w for _, _, w in scored]
 
+    def score_word(self, word, prev_word=None):
+        """单个词的统计代价（越小越优），供主引擎做「词/句同池比价」。
+
+        与 Viterbi 的整句代价同一度量体系（同参数同上下文 bonus），
+        除以音节数后即可和整句的每音节均代价直接比较。
+        prev_word: str 或多词 list（多上文衰减，见 _bi_bonus_multi）。
+        """
+        return self._cost(word) - self._bi_bonus_multi(prev_word, word)
+
     # ---------- 整句切分（Viterbi / beam search）----------
 
     def _span_cands(self, keys, mode, limit):
-        """取 [i:j) 这段音节对应的词。"""
+        """取 [i:j) 这段音节对应的词（按权重降序，去重）。
+
+        去重：by_initial/by_pinyin 里同一词可能来自多个词库（包子 同时在
+        base 和 wanxiang），重复词条白占候选名额，把有效召回深度砍半。
+        """
         key = " ".join(keys)
         d = self.de.by_pinyin if mode == "py" else self.de.by_initial
         lst = d.get(key)
         if not lst:
             return ()
-        return tuple(w for _, w in lst[:limit])
+        out, seen = [], set()
+        for _, w in lst:
+            if w in seen:
+                continue
+            seen.add(w)
+            out.append(w)
+            if len(out) >= limit:
+                break
+        return tuple(out)
 
-    def viterbi(self, keys, mode="ini", n=5, ret_cost=False):
+    def viterbi(self, keys, mode="ini", n=5, ret_cost=False, prev=""):
         """在音节序列上切分出最优整句，返回 n 个候选整句。
 
         keys: ['w','i','l','y','g','b','z']（mode="ini" 声母简拼）
               或 ['zhan','mu','si']（mode="py" 全拼音节）
+        prev: **光标处上文词**（由 caret_ctx 读出）。它决定首词的 bigram 条件——
+              这是「指哪打哪」的关键：同样的键串，在不同上文下应切出不同句子。
         ret_cost=True 时返回 (句子, 代价, 音节数)，供调用方把全拼/简拼两路
         候选按「每字平均代价」合并排序——两路的代价不可直接比较（词数不同），
         但每字平均代价语义一致。
@@ -244,21 +350,34 @@ class StatReranker:
         keys = tuple(keys[:MAX_KEYS])
         if not keys:
             return []
-        ck = (keys, mode, n, self._cache_ver)
+        ck = (keys, mode, n, self._cache_ver, prev)
         hit = self._viterbi_cache.get(ck)
         if hit is not None:
             return hit
-        out = self._viterbi_raw(keys, mode, n, ret_cost)
+        out = self._viterbi_raw(keys, mode, n, ret_cost, prev)
         if len(self._viterbi_cache) > 256:
             self._viterbi_cache.clear()
         self._viterbi_cache[ck] = out
         return out
 
-    def _viterbi_raw(self, keys, mode, n, ret_cost=False):
+    def _viterbi_raw(self, keys, mode, n, ret_cost=False, prev=""):
         m = len(keys)
         # dp[j] = [(cost, words_tuple, last_word), ...] 保留 BEAM 条最优
+        # dp[0] 的 last_word 设为光标处上文词（caret_ctx 读出），
+        # 这样首词能吃到 _bi_bonus(prev, w)——上文条件由此进入整句预测。
+        # 跨度代价预计算：_cost(w) 只依赖 w，不依赖 dp 状态。SPAN_CANDS=48
+        # 后内层循环约 64 跨度 x 48 词 x 6 状态，不预缓存的话每次击键要
+        # 重复算 ~1.8 万次 _cost，纯浪费。
+        span_cost = {}
+
+        def cost_of(w):
+            c = span_cost.get(w)
+            if c is None:
+                c = span_cost[w] = self._cost(w)
+            return c
+
         dp = [None] * (m + 1)
-        dp[0] = [(0.0, (), "")]
+        dp[0] = [(0.0, (), prev)]
         for j in range(1, m + 1):
             cand = []
             lo = max(0, j - MAX_SPAN)
@@ -270,9 +389,9 @@ class StatReranker:
                 if not words_here:
                     continue
                 for w in words_here:
-                    cw = self._cost(w)
+                    cw = cost_of(w)
                     for c0, seq, prev in prev_states:
-                        cand.append((c0 + cw - self._bi_bonus(prev, w), seq + (w,), w))
+                        cand.append((c0 + cw - self._bi_bonus_span(prev, w), seq + (w,), w))
             if not cand:
                 # 该位置切不出任何词：退回单字，保证链路不断
                 prev_states = dp[j - 1]
@@ -288,7 +407,17 @@ class StatReranker:
                     for c0, seq, prev in prev_states:
                         cand.append((c0 + 30.0, seq + (keys[j - 1],), keys[j - 1]))
             cand.sort(key=lambda t: t[0])
-            dp[j] = cand[:BEAM]
+            # 首词单字保留通道：beam 上半留全局最优，下半优先补「首词是单字」
+            # 的路径。整句的第一个词经常是 我/你/还/吃 这类单字，而 2 字词
+            # （成立 -25.9）在偶数位上系统性比 1+1 单字对（吃|了 -21.4）便宜
+            # ~2-4 nat——纯全局 top-K 会把单字开头的路径在 j=2 全灭，可它们
+            # 的共现红利（(了,一个)=395）要到 j=4 才兑现（ilygbz 案）。
+            half = max(1, BEAM // 2)
+            kept = cand[:half]
+            if len(kept) < BEAM:
+                extra = [t for t in cand[half:] if t[1] and len(t[1][0]) == 1]
+                kept += extra[: BEAM - len(kept)]
+            dp[j] = kept
         final = dp[m]
         if not final:
             return []
