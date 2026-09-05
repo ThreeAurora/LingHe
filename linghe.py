@@ -29,6 +29,7 @@ from candidate_ui import CandidateWindow
 from dict_engine import DictEngine
 from fuma import FuMa
 from mabiao import MaBiao
+from neural_rerank import NeuralReranker
 from rerank import StatReranker
 from xiaohe import decode_syllable
 import caret_ctx
@@ -64,6 +65,76 @@ PUNCT_VKS = {
     0xC0,  # ` ~
     0xDB, 0xDC, 0xDD,  # [ \
 }
+
+# 自动造词护栏：语料里几乎不连用的字（结构助词/语气词）。含任一字的组合
+# 不是词，是句子碎片（「我吃了」「我的书」）。注意只拦这些——「我想」这类
+# 名词+动词组合是正经词（主人拍板：用户会重复打的组合就该一键上屏，
+# 语言学上是不是词不重要）。
+COIN_BLOCK = set("的地得了吗呢吧啊呀哦呗嘛啦咯喽嗯哪哇噢喔哟哦呦")
+
+COIN_MAX = 5      # 造词最长字数（专名/短语上限）
+COIN_MULTI_MAX = 50000  # 混合模式里多字词片段的词频上限：超过算「句子里的
+                        # 常用词」（东西/测试/一下），不算专名词头（试作）
+
+
+def coin_pick(streak, seen, de):
+    """连续上屏片段链 → 造词判定（纯函数，便于探针单测）。
+
+    streak: [(片段, 拼音), ...] 连续上屏的单字/多字词。
+    seen: {拼接串: 已连续出现次数}（重复模式用，函数内递增）。
+    de: DictEngine（word_py 查存在性、weight 查词频）。
+
+    返回 (词, 拼音串) 或 None。从最长组合往下试，命中即止：
+      1. 纯单字 2~5 字 → 造（我想/张布斯/试作古华——词库没有就造，
+         用户用辅码逐字打出来的生僻串几乎必是专名或高频自用组合）；
+         其中 2 字组合只在整链恰为 2 片段时参与——长链的尾 2 字是
+         长组合的中间态（东西|个|一 的「个一」），不是用户的意图词；
+      2. 低频多字词+单字混合 → 造（试作|古|华：词头生僻=专名特征；
+         东西|测试|一下 这种全高频词组合是句子，不造）；
+      3. 同拼接串第二次连续出现 → 造（重复是用脚投票的最强信号，
+         兜底覆盖含常用词的混合串）。
+
+    判定时机由调用方控制：**只在断链事件**（标点/多字词边界/Esc/切窗）
+    调用——逐字 push 时判会造出「试作古」这种中间垃圾词并清链，
+    「试作古华」就永远造不出来了。
+
+    链头检查：链首是高频多字词（weight≥5万）时整链视为正常句子流
+    （东西|个|一|下 是「东西…一下」的打字过程，不是组专名）——「个一下」
+    这种中间态不造。低频词头（试作 3270）才是组专名的信号。
+    """
+    if len(streak) < 2:
+        return None
+    head = streak[0][0]
+    if len(head) >= 2 and de.weight(head) >= COIN_MULTI_MAX:
+        return None
+    for k in range(len(streak), 1, -1):
+        if k == 2 and len(streak) != 2:
+            continue  # 2 字组合只认整链（防长链尾部中间态误造）
+        frags = streak[-k:]
+        s = "".join(w for w, _ in frags)
+        n = len(s)
+        if n > COIN_MAX:
+            continue
+        if de.word_py.get(s) or de.weight(s):
+            return None  # 更长的组合已是词条，短组合被它覆盖，不再拆造
+        if any(ch in COIN_BLOCK for ch in s):
+            continue  # 含结构助词/语气词：句子碎片，试更短组合
+        if any(not p for _, p in frags):
+            return None  # 拼音不全（码表查无音的字）：防脏数据，放弃
+        multi = [w for w, _ in frags if len(w) >= 2]
+        singles = [w for w, _ in frags if len(w) == 1]
+        seen_n = seen.get(s, 0)
+        seen[s] = seen_n + 1
+        ok = False
+        if not multi:
+            ok = True  # 纯单字 2~5 字：主人拍板全造
+        elif singles and all(de.weight(m) < COIN_MULTI_MAX for m in multi):
+            ok = True  # 生僻词头+单字：专名模式（试作|古|华）
+        elif seen_n >= 1:
+            ok = True  # 重复出现
+        if ok:
+            return s, " ".join(p for _, p in frags)
+    return None
 
 
 class KBDLLHOOKSTRUCT(ctypes.Structure):
@@ -208,6 +279,12 @@ class Engine:
         self.liaison = None          # 上屏联想词列表（豆包式：上屏后提示后续词）
         self.ctx_prevs = []          # 光标处上文词列表（tail_words 切出，最近在前；
                                      # 豆包「指哪打哪」：多上文衰减打分的输入）
+        self.ctx_tail_text = ""      # 光标前原始文本尾部（神经重排的 MLM 输入）
+        self._last_pos = (300, 300)  # 最近候选窗位置（异步刷新时复用）
+        self._cache_pool_scores = {}  # 同池统计分缓存（神经精排的融合基底）
+        self._streak = []            # 连续上屏片段链（自动造词原料）：
+                                     # 张|布|斯 →「张布斯」；试作|古|华 →「试作古华」
+        self._streak_seen = {}       # 拼接串→连续出现次数（重复造词模式）
 
         self.ai = AIEngine(cfg.get("ai", {}), log=log)
         self.ai.on_result = lambda seq: self.q.put(("ai", seq))
@@ -216,6 +293,20 @@ class Engine:
         else:
             self.ai.ready = False
             log("[AI] 已按配置停用（ai.enabled=false），纯静态模式")
+
+        # 神经判别重排（RBT3 ONNX，2026-09-05 接棒 LLM）：击键仍由统计层即时
+        # 响应，神经分 ~30-100ms 后异步到达并刷新候选顺序（豆包「候选自我
+        # 修正」）。MLM 语义迁移能覆盖统计共现的天花板（打碎→易碎物）。
+        ncfg = cfg.get("neural", {})
+        self.nr = NeuralReranker(os.path.join(base_dir, ncfg.get("model_dir", "ai_neural/rbt3")),
+                                 log=log)
+        self.nr.on_result = self._on_neural
+        self.neural_top_k = int(ncfg.get("top_k", 12))
+        self.neural_lambda = float(ncfg.get("lambda", 1.0))
+        if ncfg.get("enabled", True):
+            self.nr.load_async()
+        else:
+            log("[神经] 已按配置停用（neural.enabled=false）")
 
         self.buffer = ""
         self.enabled = True
@@ -333,6 +424,12 @@ class Engine:
                 keys = [decode_syllable(code[i:i + 2]) for i in range(0, n, 2)]
                 vpool += self.rr.viterbi(keys, "py", 5, ret_cost=True, prev=prev)
             vpool += self.rr.viterbi(list(code), "ini", 5, ret_cost=True, prev=prev)
+            # 长词锚定召回：3~4 音节键串 top1 强制成句（前缀 top3 变体）。
+            # 主 beam 的统计代价被「文件体现|出」类 4 字词条链垄断，口语串
+            # （我今天想吃西湖醋鱼）全程被剪——锚定不与 beam 竞争，直接把
+            # 「我今天想吃西湖醋鱼」们塞进池，排序交给神经裁决。
+            if n >= 5:
+                vpool += self.rr.anchor_sentences(list(code), "ini", 12, prev=prev)
             vpool.sort(key=lambda t: t[1] / max(1, t[2]))
             for s, c, m in vpool:
                 if s in seen:
@@ -340,7 +437,9 @@ class Engine:
                 cps = c / max(1, m)
                 if s not in pool or cps < pool[s]:
                     pool[s] = cps  # 同串取更优代价（词条 vs 切分谁准谁上）
-        dict_side = [w for w, _ in sorted(pool.items(), key=lambda kv: kv[1])][: self.n_pool]
+        ranked_pool = sorted(pool.items(), key=lambda kv: kv[1])
+        dict_side = [w for w, _ in ranked_pool][: self.n_pool]
+        self._cache_pool_scores = dict(ranked_pool)  # 神经精排的统计基底
         base = mb_hits + mb_prefix + dict_side
         base = base[: self.n_pool]
         n_mb = len(mb_hits) + len(mb_prefix)
@@ -392,6 +491,7 @@ class Engine:
                         self.page = 0
                         self.q.put(("hide",))
                         self.stats["commits"] += 1
+                        self._streak = []  # 英文上屏：断造词链（不记录英文）
                         send_unicode(raw)
                     else:
                         self.cn_mode = not self.cn_mode
@@ -428,6 +528,8 @@ class Engine:
             self.last_fg = fg
             self.context.clear()  # 换窗口=换语境
             self.ctx_prevs = []   # 上下文也随窗口失效
+            self.ctx_tail_text = ""
+            self._streak_clear()  # 造词链同样随窗口失效（先结算再清）
             self.liaison = None
             self.q.put(("hide",))
 
@@ -456,8 +558,10 @@ class Engine:
                     before, _after = caret_ctx.read_context(before=64, after=0)
                     self.ctx_prevs = caret_ctx.tail_words(
                         before, self.de.word_py if self.de.loaded else None, 3)
+                    self.ctx_tail_text = before[-32:]
                 except Exception:
                     self.ctx_prevs = []
+                    self.ctx_tail_text = ""
             if len(self.buffer) < self.max_len:
                 self.buffer += chr(vk).lower()
             # 第 5 码起继续组码（纯双拼续词）；超 max_len 后吞键防漏字母
@@ -529,6 +633,7 @@ class Engine:
 
         if vk == VK_ESCAPE and self.buffer:
             self.buffer = ""
+            self._streak_clear()  # 放弃组码：链先结算再清
             self.q.put(("hide",))
             return self._eat()
 
@@ -538,6 +643,7 @@ class Engine:
             self.buffer = ""
             self.q.put(("hide",))
             self.stats["commits"] += 1
+            self._streak = []  # 英文上屏：断造词链（不记录英文）
             send_unicode(raw)
             return self._eat()
 
@@ -545,12 +651,37 @@ class Engine:
             cands, n_mb = self.compute(self.buffer)
             if cands:  # 组码中标点：上屏首选，随后标点照常进应用
                 self._commit(cands[0], 0, n_mb)
+            self._streak_clear()  # 标点=句子边界：链先结算再清
             return user32.CallNextHookEx(None, ncode, wparam, lparam)
 
         if self.buffer:
             self.buffer = ""
             self.q.put(("hide",))
         return user32.CallNextHookEx(None, ncode, wparam, lparam)
+
+    def _on_neural(self, code, scores, ms):
+        """神经精排返回（worker 线程）：统计分 + λ·每字logP 重排动态区，刷新当前页。
+
+        只重排池内已有的候选（MLM 打分是判别式的：不生成、只裁决）。
+        buffer 已变（用户继续击键/已上屏）则丢弃本包结果。
+        """
+        if self.buffer != code or not scores:
+            return
+        base = self._cache_cands
+        n_mb = self._cache_nmb
+        if not base or n_mb >= len(base):
+            return
+        tail = base[n_mb:]
+        # 符号约定：logP 是概率对数（越大越好），代价越小越好 → 用减法：
+        # 概率高（logP 趋近 0）的候选被减得少 = 代价保持低 = 排前。
+        rescored = [(self._cache_pool_scores[w] - self.neural_lambda * scores[w], w)
+                    for w in tail if w in scores and w in self._cache_pool_scores]
+        rest = [w for w in tail if w not in scores or w not in self._cache_pool_scores]
+        rescored.sort()
+        merged = base[:n_mb] + [w for _, w in rescored] + rest
+        self._cache_cands = merged
+        self.q.put(("show", self.buffer, merged, n_mb, self._last_pos))
+        self.log("[神经] %s 精排%d词 %dms" % (code, len(rescored), ms))
 
     def _eat(self):
         self.stats["eaten"] += 1
@@ -563,10 +694,19 @@ class Engine:
             return
         cands, n_mb = self.compute(self.buffer)
         pos = caret_pos()
+        self._last_pos = pos
         if cands:
             self.q.put(("show", self.buffer, cands, n_mb, pos))
         else:
             self.q.put(("think", self.buffer, pos))  # 静态零命中，AI 在途
+        # 神经精排：全窗口送裁（豆包式「候选自我修正」）。池里不只词——
+        # viterbi 整句也在（5~12 字），max_cand=16 的伪似然能整句进模型。
+        # 实测整句裁决区分度极强（口语通顺度是 MLM 的参数知识）：
+        # 「那我给你个东西测试一下」-6.56 完胜新闻腔「年我国能够的乡村
+        # 是一些」-7.78——统计共现（新闻语料）系统性偏向书面腔，口语句
+        # 的召回/排序缺口由神经层补。异步不阻塞击键。
+        if self.nr.ready and len(self.buffer) >= 2 and len(cands) > n_mb:
+            self.nr.request(self.buffer, self.ctx_tail_text, cands[n_mb:])
         # AI 只在长码（第 5 码起）时补位：短码静态侧（码表+底库+重排）已足够强，
         # 生成式 LLM 也物理上进不了打字节奏（200ms/字 vs 300ms+ 热调用）。
         # 整句场景有天然停顿（打完一串键才看结果），AI 300ms 能赶上。
@@ -591,6 +731,9 @@ class Engine:
             cand = " ".join(syls)
             if all(s in self.de.valid_sylls for s in syls):
                 py = cand
+        # 造词链的拼音（必须在 buffer 清空前取）：底库词走 word_py；
+        # 码表单字/辅码筛选字走 buffer 前两键反解（音形码前两键=双拼音节）
+        coin_py = self._coin_py(word) if self.de.loaded else ""
         self.buffer = ""
         self.page = 0
         self.q.put(("hide",))
@@ -612,6 +755,7 @@ class Engine:
         if py:
             self.de.remember(word, py)  # 新词入库/旧词调频，批量落盘
         send_unicode(word)  # 注入事件自带 INJECTED 标志，会被钩子放行
+        self._streak_push(word, coin_py)  # 连续片段链：自动造词原料
         # 上屏联想（豆包式）：提示后面可能的词，空格上屏首选，数字键选其余
         self.liaison = None
         if self.cfg.get("liaison", True):
@@ -620,6 +764,69 @@ class Engine:
             if nxt:
                 self.liaison = nxt
                 self.q.put(("liaison", word, self.liaison, caret_pos()))
+
+    # ---- 自动造词：连续上屏片段链 ----
+    # 原理：词库里没有的组合，用户用辅码逐字打出来（张|布|斯、试|作|古|华），
+    # 这本身就是「这是个词」的最强证据——打字人比任何语料库都清楚自己要什么。
+    # 豆包靠云端热词表盖住这类专名；我们端侧对应物是两件事：用户打一遍
+    # 永远拥有（造词）+ 公共热词管线定期注入（dicts/hotwords_inc）。
+
+    @staticmethod
+    def _is_hanzi(word):
+        return bool(word) and all("\u4e00" <= ch <= "\u9fff" for ch in word)
+
+    def _coin_py(self, word):
+        """造词用的拼音：底库 word_py 优先，单字音形码走 buffer 前两键反解。
+
+        buffer 前两键=双拼音节对小鹤音形码恒成立（音码 2 键在前、形码在后），
+        所以 vlh→vl→zhang、bus→bu、siv→si 都能反解。查不到返回空串（造词
+        放弃该链，防脏数据）。
+        """
+        p = self.de.word_py.get(word)
+        if p:
+            return p
+        if len(word) == 1 and len(self.buffer) >= 2:
+            s = decode_syllable(self.buffer[:2])
+            if s in self.de.valid_sylls:
+                return s
+        return ""
+
+    def _streak_push(self, word, py):
+        """上屏词推入片段链。**只积累，不判定**——判定统一在断链事件
+        （标点/Esc/切窗/多字词边界）里做，否则「试|作|古」会先造出中间
+        垃圾词「试作古」并清链，「试作古华」永远造不出来。
+
+        多字词=天然边界：先结算旧链再重启。非中文（英文/混合）直接断链
+        ——主人明令：不记录英文。
+        """
+        if not py or not self._is_hanzi(word):
+            self._streak_clear()
+            return
+        if len(word) >= 2:
+            self._coin_try()
+            self._streak = [(word, py)]
+        else:
+            self._streak.append((word, py))
+            if len(self._streak) > 8:
+                self._streak.pop(0)
+
+    def _streak_clear(self):
+        """断链（标点/英文/Esc/切窗）。断前先把可造的造掉——「我|吃」接
+        标点也是主人的自用词，不能白打。"""
+        self._coin_try()
+        self._streak = []
+
+    def _coin_try(self):
+        if not self.de.loaded or len(self._streak) < 2:
+            return
+        hit = coin_pick(self._streak, self._streak_seen, self.de)
+        if hit:
+            s, py_join = hit
+            self.de.remember(s, py_join)  # 入 user_dict：weight 起步 10 万，
+            # 之后每打一次 remember 调频——越用越靠前，与手选词同机制
+            self._streak = []
+            self.q.put(("flash", "[已造词:%s]" % s))
+            self.log("[造词] %s (%s)" % (s, py_join))
 
     # ---- 安装/卸载 ----
     def install_hook(self):
@@ -740,7 +947,8 @@ def main():
         root.protocol("WM_DELETE_WINDOW", lambda: (eng.uninstall_hook(), root.destroy()))
     poll()
     root.mainloop()
-    # 退出前把用户词频与 bigram 共现落盘（防丢）
+    # 退出前把用户词频与 bigram 共现落盘（防丢）；造词链也做最后一次结算
+    eng._coin_try()
     eng.de.flush()
     eng.rr.flush()
     return 0
