@@ -117,6 +117,11 @@ class NeuralReranker:
                 path = fp16  # fp16 优先（DML 走 GPU 更快；CPU 跑 fp16 会自动转 fp32）
             opts = ort.SessionOptions()
             opts.log_severity_level = 3
+            # 禁用图优化：onnxruntime 1.24 的 SimplifiedLayerNormFusion 在
+            # RBT3 fp16 模型上初始化即崩（InsertedPrecisionFreeCast 找不到
+            # 节点参数，2026-09-06 实测钉死）。代价是 CPU 推理慢一点，
+            # RBT3 三层小模型可接受。
+            opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
             try:
                 self.sess = ort.InferenceSession(
                     path, opts,
