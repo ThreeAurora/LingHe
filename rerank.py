@@ -371,21 +371,22 @@ class StatReranker:
 
         去重：by_initial/by_pinyin 里同一词可能来自多个词库（包子 同时在
         base 和 wanxiang），重复词条白占候选名额，把有效召回深度砍半。
+        ini 模式走双拼简容错口径（s/c/z 命中平/翘舌两组，见
+        dict_engine.initial_span）。
         """
-        key = " ".join(keys)
-        d = self.de.by_pinyin if mode == "py" else self.de.by_initial
-        lst = d.get(key)
-        if not lst:
-            return ()
-        out, seen = [], set()
-        for _, w in lst:
-            if w in seen:
-                continue
-            seen.add(w)
-            out.append(w)
-            if len(out) >= limit:
-                break
-        return tuple(out)
+        if mode == "py":
+            key = " ".join(keys)
+            lst = self.de.by_pinyin.get(key) or ()
+            out, seen = [], set()
+            for _, w in lst:
+                if w in seen:
+                    continue
+                seen.add(w)
+                out.append(w)
+                if len(out) >= limit:
+                    break
+            return tuple(out)
+        return self.de.initial_span(keys, limit)
 
     def viterbi(self, keys, mode="ini", n=5, ret_cost=False, prev=""):
         """在音节序列上切分出最优整句，返回 n 个候选整句。
@@ -429,45 +430,64 @@ class StatReranker:
             return []
         out, seen = [], set()
 
-        def greedy(seq):
-            words, i = [], 0
-            while i < len(seq):
+        def beam_seg(seq, bw=4):
+            """分段 beam：每步 L=4..1 各取 top2 词扩展，收 bw 条完整骨架。
+
+            2026-09-06 武媚娘传奇案：top1 贪心在「外贸年」类高权同键词上
+            必岔（'w m n' 的 top1），weight 1200 的「武媚娘」永远出不了头
+            ——骨架句的价值不在权重在「词库真实词填满键串」，beam 让低权
+            真词路径同场竞技，排序交 LLM 终审。
+            """
+            finished, states = [], [([], 0)]
+            while states:
+                ws, i = states.pop(0)
+                if i >= len(seq):
+                    finished.append(ws)
+                    if len(finished) >= bw:
+                        break
+                    continue
+                ext = []
                 for L in (4, 3, 2, 1):
-                    if i + L <= len(seq):
-                        lst = self.de.by_pinyin.get(" ".join(seq[i:i + L])) \
-                            if mode == "py" \
-                            else self.de.by_initial.get(" ".join(seq[i:i + L]))
-                        if lst:
-                            words.append(lst[0][1])
-                            i += L
-                            break
-                else:
-                    i += 1  # 该键无任何词（罕见）：跳过
-            return words
+                    if i + L > len(seq):
+                        continue
+                    if mode == "py":
+                        lst = self.de.by_pinyin.get(" ".join(seq[i:i + L])) or ()
+                        tops = [w for _, w in lst[:2]]
+                    else:
+                        tops = list(self.de.initial_span(seq[i:i + L], 2))
+                    ext.extend((ws + [w], i + L) for w in tops)
+                states.extend(ext[:bw])
+                if len(states) > 16:
+                    states = states[:16]
+            return finished
 
         for rev in (False, True):
             seq = list(keys)[::-1] if rev else list(keys)
-            words = greedy(seq)
-            if rev:
-                words = words[::-1]  # 从尾向头收集的词要翻回正序
-            if not words:
-                continue
-            s = "".join(words)
-            if s in seen or len(s) < 3:
-                continue
-            seen.add(s)
-            # 代价=Σ词代价（与主 beam 同量级，保证池内比价不虚）；本通道的
-            # 价值不在统计比价，在「产出目标骨架句」交给伪似然终审
-            total = sum(self._cost(w) for w in words)
-            out.append((s, total, len(s)))
+            for words in beam_seg(seq):
+                if rev:
+                    words = words[::-1]
+                if not words:
+                    continue
+                s = "".join(words)
+                if s in seen or len(s) < 3:
+                    continue
+                seen.add(s)
+                # 代价=Σ词代价（与主 beam 同量级，保证池内比价不虚）；本通道的
+                # 价值不在统计比价，在「产出目标骨架句」交给伪似然终审
+                total = sum(self._cost(w) for w in words)
+                out.append((s, total, len(s)))
         return out
 
     def _char_inv(self):
-        """单字声母索引（小鹤键位口径），按口语频排序。懒加载缓存。"""
+        """单字声母索引（小鹤键位口径），按口语频排序。懒加载缓存。
+
+        双拼简容错：首字母键 s/c/z 的候选组并入对应翘舌组（u/i/v）——
+        主人 2026-09-06 键码里 上/睡=sh 用了 s，字链通道同样要能命中。
+        """
         if self._char_inv_cache is not None:
             return self._char_inv_cache
         SM2KEY = {"zh": "v", "ch": "i", "sh": "u"}
-        inv = {}
+        raw = {}
         for w, py in self.de.word_py.items():
             if len(w) != 1 or not ("\u4e00" <= w <= "\u9fff"):
                 continue
@@ -476,10 +496,14 @@ class StatReranker:
                 continue
             k = parts[0][:2] if parts[0][:2] in ("zh", "ch", "sh") \
                 else parts[0][0]
-            inv.setdefault(SM2KEY.get(k, k), set()).add(w)
-        self._char_inv_cache = {
-            k: sorted(v, key=lambda w: -self._spoken(w))[:10]
-            for k, v in inv.items()}
+            raw.setdefault(SM2KEY.get(k, k), set()).add(w)
+        inv = {k: sorted(v, key=lambda w: -self._spoken(w))[:10]
+               for k, v in raw.items()}
+        for plain, canon in (("s", "u"), ("c", "i"), ("z", "v")):
+            pool = raw.get(plain, set()) | raw.get(canon, set())
+            if pool:
+                inv[plain] = sorted(pool, key=lambda w: -self._spoken(w))[:10]
+        self._char_inv_cache = inv
         return self._char_inv_cache
 
     def char_chains(self, keys, mode="ini", n=6, beam=32, prev=""):
@@ -602,33 +626,44 @@ class StatReranker:
             for L in (2, 4):
                 if i + L > m:
                     continue
-                lst = self.de.by_pinyin.get(" ".join(keys[i:i + L])) \
-                    if mode == "py" \
-                    else self.de.by_initial.get(" ".join(keys[i:i + L]))
-                if not lst:
+                if mode == "py":
+                    lst = self.de.by_pinyin.get(" ".join(keys[i:i + L])) or ()
+                    top_words, seen_w = [], set()
+                    for _, w in lst:
+                        if w not in seen_w:
+                            seen_w.add(w)
+                            top_words.append(w)
+                        if len(top_words) >= 48:
+                            break
+                else:
+                    # 双拼简容错口径（s/c/z 命中平/翘舌两组），已按权重
+                    # 降序去重——首字母键码也能锚到 上/睡/传 类翘舌词
+                    top_words = list(self.de.initial_span(keys[i:i + L], 48))
+                if not top_words:
                     continue
                 if L == 4:
                     # span4 也设词频门槛：4 音节键串候选稀少，top1 常是
                     # 「小吃小喝(1889)/通讯程序(1725)/误尽天下(1006)」类
                     # 低频怪词——它们占锚产出纯垃圾句；真锚西湖醋鱼(3607)/
                     # 测试一下(14305)/那个东西(9620) 全部过线（2026-09-05 实测）
-                    if self.de.weight(lst[0][1]) >= ANCHOR2_FREQ:
-                        cores.append((i, i + L, lst[0][1]))
+                    if self.de.weight(top_words[0]) >= ANCHOR2_FREQ:
+                        cores.append((i, i + L, top_words[0]))
                 else:
                     # 口语序去重取前 6：底库 rank 是书面语料的序（xi 组
                     # 想吃 rank11 被消除/县城/薪酬压制），口语 zipf 序里
                     # 想吃升到第 5——按口语频排序后再取（2026-09-05 实测）
-                    uniq, seen_w = [], set()
-                    for _, w in lst:
-                        if w in seen_w:
-                            continue
-                        seen_w.add(w)
-                        uniq.append(w)
-                        if len(uniq) >= 32:
-                            break
-                    uniq.sort(key=lambda w: -self._spoken(w))
-                    for w in uniq[:6]:
-                        if self.de.weight(w) >= ANCHOR2_FREQ:
+                    # 准入双通道（2026-09-06 wztwsmsh 案）：书面 weight≥3000
+                    # 或口语频≥480——「没睡/丢下」类口语词书面权重不足 3000
+                    # 被旧门槛挡在核外，锚点串接只剩「没说」类书面同键词
+                    # 口语序→掺权序（weight 主导 + 口语加权）：2gram 碎片
+                    # 词（到现/得像）靠字对频次在纯口语序里压真词（丢下），
+                    # 掺权后碎片(weight<1000)沉底（2026-09-06 bydxwhm 案）
+                    uniq = top_words[:32]
+                    uniq.sort(key=lambda w: -self.de._spoken_rank(
+                        w, self.de.weight(w)))
+                    for w in uniq[:10]:
+                        if self.de.weight(w) >= ANCHOR2_FREQ \
+                                or self._spoken(w) >= 480:
                             cores.append((i, i + L, w))
         if not cores:
             return []
@@ -636,7 +671,7 @@ class StatReranker:
         # 想吃 zipf 升 xi 组第 5，见 docstring 与 _spoken 注释）
         cores.sort(key=lambda a: (-(a[1] - a[0]), -self._spoken(a[2]), a[0]))
         # ---- 每个锚为核心：前缀 viterbi top1 + 本锚 + 右侧就近串接 ----
-        out, seen_sent, seen_core, seen_prefix = [], set(), set(), set()
+        out, seen_sent, seen_core = [], set(), set()
         for (ai, aj, aw) in cores:
             if aw in seen_core:
                 continue
@@ -645,15 +680,10 @@ class StatReranker:
                 if ai else [("", 0.0, 0)]
             if not pres:
                 continue
-            # 同前缀去重：核心=查询缓存/出现/重新……系列共享同一 viterbi
-            # 前缀（文件他想…），8 个垃圾变体占满候选池把真句挤到 13 名
-            # 外（2026-09-05 实测）。前缀是骨架，同骨架留口语频最高的核心
-            # 即可——核心已按口语序轮询，先到先得。
-            pk = pres[0][0]
-            if pk and pk in seen_prefix:
-                continue
-            if pk:
-                seen_prefix.add(pk)
+            # 同前缀去重已废除（2026-09-06 bydxwhm 案钉死）：旧规则同前缀
+            # 只留口语频最高核——「不要」前缀下 东西(38127) 霸位，丢下
+            # (2517) 永远进不了串接。裁判时代垃圾句按分数沉底不再挤排名，
+            # 池名额由 n 封顶，每个过门槛的核都给串接机会。
             # 词链（不拼串）：同起点并列的选择统计信号全线失效——weight 压
             # （想吃 rank11）、衔接字级共现噪声压（(天,宣)=31「今天宣传」、
             # (天,选)「天选」压 (天,想)=6）。**只有神经终审能裁**：
@@ -677,14 +707,17 @@ class StatReranker:
                 while True:
                     ahead = [a for a in cores if a[0] >= pos]
                     if not ahead:
-                        gap = self.viterbi(keys[pos:], mode, 1)
-                        if gap and gap[0]:
-                            words = words + [gap[0]]
-                        sent = "".join(words)
-                        if sent not in seen_sent:
-                            seen_sent.add(sent)
-                            out.append((sent, total, m))
-                            made += 1
+                        # 尾缝 top2：单键尾字歧义（h→和/好）交 LLM 终审，
+                        # 召回侧两种都给（2026-09-06 wztwsmsh 案）
+                        gap = self.viterbi(keys[pos:], mode, 2)
+                        for g in (gap or [])[:2]:
+                            if not g:
+                                continue
+                            sent = "".join(words + [g[0]])
+                            if sent not in seen_sent:
+                                seen_sent.add(sent)
+                                out.append((sent, total, m))
+                                made += 1
                         break
                     nmin = min(a[0] for a in ahead)  # 就近优先
                     same = [a for a in ahead if a[0] == nmin]
@@ -722,6 +755,15 @@ class StatReranker:
                         forks -= 1
                         for b in branch:
                             queue.append(_adv(b, words, forks))
+                    # 缝隙次优变体（2026-09-06 wztwsmsh 案）：中缝单键的
+                    # viterbi top1 被书面搭配（没说/和）压住（没睡/好），
+                    # top2 入队交 LLM 终审裁决，召回侧两种都给
+                    if main[0] > pos:
+                        gap2 = self.viterbi(keys[pos:main[0]], mode, 2)
+                        if len(gap2) > 1 and gap2[1] and gap2[1][0] \
+                                and (not gap2[0] or gap2[1][0] != gap2[0][0]):
+                            queue.append((main[1],
+                                          words + [gap2[1][0], main[2]], 0))
                     pos, words, forks = _adv(main, words, forks)
                     # 主链原地继续推进；副链在栈中稍后处理
             if len(out) >= n:

@@ -1,0 +1,95 @@
+{
+	"type": "gh",
+	"name": "thunlp/THUOCL",
+	"version": "master",
+	"default": null,
+	"files": [
+		{
+			"type": "directory",
+			"name": "data",
+			"files": [
+				{
+					"type": "file",
+					"name": "THUOCL_animal.txt",
+					"hash": "vNyVoy/nE9S8MpV64mF047RkkI4xjoIcmrspXpAkkUU=",
+					"size": 320553
+				},
+				{
+					"type": "file",
+					"name": "THUOCL_caijing.txt",
+					"hash": "aOY9IAnlnG84juqnidGbamgWV94+jlbMNHmyHNhUhUI=",
+					"size": 62296
+				},
+				{
+					"type": "file",
+					"name": "THUOCL_car.txt",
+					"hash": "WP/XVriehXSFK8csJUJ2odf6iCE0LrPL875zyjOrkhw=",
+					"size": 32492
+				},
+				{
+					"type": "file",
+					"name": "THUOCL_chengyu.txt",
+					"hash": "wznV1uN9T47Ny4LyoCt/38ZnlvClIVFV8q/4p36Jp+s=",
+					"size": 166549
+				},
+				{
+					"type": "file",
+					"name": "THUOCL_diming.txt",
+					"hash": "ylV0OZ2ldQosNtw3PzbjGmbtH4pLIWRt9spE7AuIjYk=",
+					"size": 640673
+				},
+				{
+					"type": "file",
+					"name": "THUOCL_food.txt",
+					"hash": "CEyqlq1Pl2cgAD6UIAl7p8td27F/n4yPdrxLjgzHd/0=",
+					"size": 144749
+				},
+				{
+					"type": "file",
+					"name": "THUOCL_IT.txt",
+					"hash": "6M1CyfVVlzX6O/uRUVy+BR+ZHv1KgDA4odXA2oWvNSY=",
+					"size": 308187
+				},
+				{
+					"type": "file",
+					"name": "THUOCL_law.txt",
+					"hash": "jvGl9BBSrJXe3eiLFnxQMaQ7PgIRvxKLYSVzbMdu97I=",
+					"size": 277745
+				},
+				{
+					"type": "file",
+					"name": "THUOCL_lishimingren.txt",
+					"hash": "0OUJQBbm24xV02PcAi9I97F1PPbQfiFvY89SLOjlNgU=",
+					"size": 163136
+				},
+				{
+					"type": "file",
+					"name": "THUOCL_medical.txt",
+					"hash": "oB858Wd68LamILvGi/KT6OQ28GJIt0rbYlzWHZrXu80=",
+					"size": 308805
+				},
+				{
+					"type": "file",
+					"name": "THUOCL_poem.txt",
+					"hash": "9wRVcfVxFKOnDS6q7sj5kYl9U2voCPkxYXCfEonIEIw=",
+					"size": 294695
+				}
+			]
+		},
+		{
+			"type": "file",
+			"name": "LICENSE",
+			"hash": "20uMykFNtM9Ie5M9B6BRT3fK9E+fPTkvK8nXug1RHFg=",
+			"size": 1063
+		},
+		{
+			"type": "file",
+			"name": "README.md",
+			"hash": "OI+dA1HVEbzSpez3FLdi2CKqvDdeznEKrphofrDVvMM=",
+			"size": 7104
+		}
+	],
+	"links": {
+		"stats": "https://data.jsdelivr.com/v1/stats/packages/gh/thunlp/THUOCL@master"
+	}
+}

@@ -438,14 +438,18 @@ class Engine:
             vpool = []
             if n % 2 == 0 and n >= 4:
                 keys = [decode_syllable(code[i:i + 2]) for i in range(0, n, 2)]
-                vpool += self.rr.viterbi(keys, "py", 5, ret_cost=True, prev=prev)
-            vpool += self.rr.viterbi(list(code), "ini", 5, ret_cost=True, prev=prev)
+                vpool += self.rr.viterbi(keys, "py", 8, ret_cost=True, prev=prev)
+                # py 全码同样走锚定召回（2026-09-06 双拼全码批测案）：py
+                # 模式原本只有 viterbi，书面长词链垄断的病一样存在
+                if n >= 5:
+                    vpool += self.rr.anchor_sentences(keys, "py", 20, prev=prev)
+            vpool += self.rr.viterbi(list(code), "ini", 8, ret_cost=True, prev=prev)
             # 长词锚定召回：3~4 音节键串 top1 强制成句（前缀 top3 变体）。
             # 主 beam 的统计代价被「文件体现|出」类 4 字词条链垄断，口语串
             # （我今天想吃西湖醋鱼）全程被剪——锚定不与 beam 竞争，直接把
             # 「我今天想吃西湖醋鱼」们塞进池，排序交给神经裁决。
             if n >= 5:
-                vpool += self.rr.anchor_sentences(list(code), "ini", 12, prev=prev)
+                vpool += self.rr.anchor_sentences(list(code), "ini", 20, prev=prev)
                 # 贪心最大匹配通道：目标句每段都是词库真实词（给你=7、
                 # 东西=3、测试一下=1、西湖醋鱼=1），统计 beam 却被「文件
                 # 体现|出」类书面长词链垄断（beam256 也召不回）——本通道
@@ -895,7 +899,14 @@ def main():
     ap.add_argument("--smoke-seconds", type=float, default=3.0)
     args = ap.parse_args()
 
-    base = os.path.dirname(os.path.abspath(__file__))
+    if getattr(sys, "frozen", False):
+        # PyInstaller 打包：数据目录（dicts/mabiao/ai_neural）放在 exe 旁边
+        base = os.path.dirname(os.path.abspath(sys.executable))
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
+    if sys.stdout is None:  # windowed 打包无控制台，print 兜底防崩
+        sys.stdout = open(os.devnull, "w", encoding="utf-8")
+        sys.stderr = sys.stdout
     sys.path.insert(0, base)
     cfg = load_cfg(base)
 

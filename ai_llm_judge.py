@@ -46,7 +46,7 @@ PRIMER = ("<|endoftext|>我们明天去公园吧。你吃饭了吗？这个东�
 class QwenJudge:
     """Qwen2.5-0.5B 整句判别打分器 + 异步请求队列（NeuralReranker 孪生接口）。"""
 
-    def __init__(self, model_dir, log=print, max_cand=40, bs=8):
+    def __init__(self, model_dir, log=print, max_cand=48, bs=8):
         self.dir = model_dir
         self.log = log
         self.ready = False
@@ -86,17 +86,24 @@ class QwenJudge:
 
     # ---------- 打分 ----------
 
-    def score(self, cands):
+    def score(self, cands, ctx_text=""):
         """批量整句打分：返回 {句: 每字平均logP}（越大=口语域越自然）。
 
         教师强制：一次前向读候选逐字 log-softmax，无自回归漂移。
-        与 RBT3 伪似然同向同量纲（每字 logP），回调侧零改动复用。
+        ctx_text：上文尾串（如「诗仙」「我今天吃了一个」）——2026-09-06
+        主人样本钉死：无条件下 2 字词判别失效（诗仙+lb 里 来吧 -4.94
+        压过 李白，接龙专名全灭）；条件化后 诗圣+df 里 杜甫 -7.56
+        完胜 对方 -9.51。logP 只数候选自身 token，上文只是条件。
         """
         if not self.ready or not cands:
             return {}
         tok, model, p_ids = self._tok, self._model, self._p_ids
         import torch
-        seqs = [p_ids + tok.encode(s, add_special_tokens=False) for s in cands]
+        ctx_ids = tok.encode(ctx_text[-16:], add_special_tokens=False) \
+            if ctx_text else []
+        p0 = len(p_ids) + len(ctx_ids)
+        seqs = [p_ids + ctx_ids + tok.encode(s, add_special_tokens=False)
+                for s in cands]
         out = {}
         pad = tok.pad_token_id or tok.eos_token_id
         for lo in range(0, len(seqs), self.bs):
@@ -109,7 +116,6 @@ class QwenJudge:
                 att[r, :len(s)] = 1
             logits = model(ids, attention_mask=att).logits
             lsm = torch.log_softmax(logits, -1)
-            p0 = len(p_ids)
             for r, s in enumerate(chunk):
                 nc = len(s) - p0
                 if nc <= 0:
@@ -123,22 +129,27 @@ class QwenJudge:
     # ---------- 异步请求（与 NeuralReranker 同构） ----------
 
     def request(self, code, ctx_text, cands):
-        """ctx_text 参数与 NeuralReranker 对齐（当前未用，留接口）。"""
         if self.ready and cands:
-            self._q.put((code, cands[:self.max_cand]))
+            # 整句优先占名额：统计序里句子排在尾部（粗拼接值大），max_cand
+            # 截断会先把句子切掉（2026-09-06 批测钉死）——裁判的核心价值就
+            # 在整句裁决，词侧有统计+融合分兜底
+            sents = [c for c in cands if len(c) >= 5]
+            words = [c for c in cands if len(c) < 5]
+            self._q.put((code, (ctx_text or "")[-16:],
+                         (sents + words)[:self.max_cand]))
 
     def _worker(self):
         while True:
-            code, cands = self._q.get()
+            code, ctx_text, cands = self._q.get()
             # 只处理最新请求：连击时中间码的精排没有意义
             try:
                 while True:
-                    code, cands = self._q.get_nowait()
+                    code, ctx_text, cands = self._q.get_nowait()
             except queue.Empty:
                 pass
             try:
                 t0 = time.perf_counter()
-                scores = self.score(cands)
+                scores = self.score(cands, ctx_text)
                 ms = round((time.perf_counter() - t0) * 1000)
                 if self.on_result:
                     self.on_result(code, scores, ms)

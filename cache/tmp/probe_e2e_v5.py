@@ -37,7 +37,7 @@ if not qj.ready:
 def e2e(code, want):
     t0 = time.perf_counter()
     pool = {}
-    vpool = list(rr.viterbi(list(code), "ini", 5, ret_cost=True))
+    vpool = list(rr.viterbi(list(code), "ini", 8, ret_cost=True))
     vpool += rr.anchor_sentences(list(code), "ini", 12)
     vpool += rr.max_match_sentences(list(code), "ini")
     vpool += rr.char_chains(list(code), "ini", 6)

@@ -1,0 +1,51 @@
+=== 单字注音检查 ===
+  差: py=cha        ini=c  weight=573616
+  智: py=zhi        ini=z  weight=310406
+  能: py=neng       ini=n  weight=59336
+  还: py=hai        ini=h  weight=6776145
+  是: py=shi        ini=s  weight=31422712
+  太: py=tai        ini=t  weight=1962845
+  吃: py=chi        ini=c  weight=1445563
+  了: py=le         ini=l  weight=3481243
+  包: py=bao        ini=b  weight=667583
+  子: py=zi         ini=z  weight=8641973
+  够: py=gou        ini=g  weight=768470
+  不: py=bu         ini=b  weight=2985809
+
+=== 词的简拼索引检查 ===
+  还是   ini=h s      span内排名=-1  top8=['黑色', '红色', '黄色', '灰色', '还算', '会所', '好似', '活塞']
+  不够   ini=b g      span内排名=2  top8=['报告', '不过', '不够', '变更', '不敢', '宾馆', '不管', '办公']
+  智能   ini=z n      span内排名=-1  top8=['子女', '在你', '在内', '在那', '灾难', '在您', '在哪', '最能']
+  一个   ini=y g      span内排名=0  top8=['一个', '有关', '应该', '员工', '阳光', '英国', '有个', '严格']
+  包子   ini=b z      span内排名=4  top8=['不足', '不再', '并在', '不在', '包子', '班子', '不做', '鼻子']
+  吃了   ini=c l      span内排名=-1  top8=['材料', '策略', '测量', '此类', '村里', '从来', '财力', '残留']
+  太差   ini=t c      span内排名=-1  top8=['陶瓷', '题材', '天才', '套餐', '图层', '探测', '他从', '他才']
+
+=== 共现对覆盖 ===
+  (吃,了): user=0 pre_word=0 pre_char(吃,了)=74
+  (了,一个): user=0 pre_word=382 pre_char(了,一)=3403
+  (一个,包子): user=0 pre_word=0 pre_char(个,包)=11
+  (吃,什么): user=0 pre_word=8 pre_char(吃,什)=8
+  (什么,时候): user=0 pre_word=31 pre_char(么,时)=38
+  (还是,不): user=0 pre_word=8 pre_char(是,不)=613
+  (还是,不够): user=0 pre_word=0 pre_char(是,不)=613
+  (不够,智能): user=0 pre_word=0 pre_char(够,智)=0
+  (不,够): user=0 pre_word=0 pre_char(不,够)=49
+  (是,不): user=0 pre_word=0 pre_char(是,不)=613
+  (还是,太): user=0 pre_word=0 pre_char(是,太)=50
+  (太,差): user=0 pre_word=0 pre_char(太,差)=24
+  (差,了): user=0 pre_word=0 pre_char(差,了)=6
+  (是,太): user=0 pre_word=0 pre_char(是,太)=50
+  (智能,还): user=0 pre_word=0 pre_char(能,还)=15
+
+=== Viterbi 三用例（简拼） ===
+  ✗ ilygbz -> ['成立一个不子', '成立一个不做', '成立一个不在', '成立一个被子', '成立一个不自']
+  ✗ hubgvn -> ['和设备个只那', '和设备个只能', '和设备过只那', '和设备个指南', '和设备个这那']
+  ✗ hutil -> ['或是突出了', '好是突出了', '或是突出来', '好是突出来', '和生态处理']
+  ✗ wilygbz -> ['完成了一个不子', '完成了一个不做', '完成了一个不在', '完成了一个被子', '完成了一个不自']
+
+=== 联想链检查 ===
+  next_word(吃) = ['什么', '饺子', '红薯', '东西', '面条']
+  next_word(还是) = ['在', '有', '一个', '要', '从']
+  next_word(了) = ['一个', '许多', '中国', '自己', '一些']
+  next_word(一个) = ['重要', '新', '人', '中国', '国家']

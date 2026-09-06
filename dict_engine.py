@@ -21,6 +21,22 @@ _YUN_FIRST = {}  # 兜底：简拼需要韵母信息时不用，此处仅声母
 
 _SM_CACHE = {}
 
+# 首字母容错：简拼键 s/c/z 同时命中平舌（本键）与翘舌（双拼正键 u/i/v）组。
+# 索引键是 _sm_key 口径（sh 词挂在 u 下），所以 s→u 而非 s→sh。
+_SM_EXPAND = {"s": ("s", "u"), "c": ("c", "i"), "z": ("z", "v")}
+
+
+def _ini_variants(keys):
+    """键串的首字母容错变体（32 个封顶，防长码组合爆炸）。"""
+    variants = [()]
+    for k in keys:
+        opts = _SM_EXPAND.get(k, (k,))
+        if len(variants) * len(opts) > 32:
+            opts = (k,)
+        variants = [v + (o,) for v in variants for o in opts]
+    return variants
+
+
 
 def _sm_key(syllable: str) -> str:
     """全拼音节 → 双拼声母键（zh/ch/sh→v/i/u，其余首字母）。
@@ -194,10 +210,51 @@ class DictEngine:
                 self.by_pinyin.setdefault(p, []).append((100000 + c, w))
                 self.by_initial.setdefault(" ".join(_sm_key(s) for s in p.split()), []).append((100000 + c, w))
                 self.size += 1
+        self._load_spoken(dir_path)
         self.loaded = True
         self.user_dict_path = os.path.join(dir_path, "user_dict.txt")
         ms = round((time.perf_counter() - t0) * 1000)
         self.log("[底库] %d 个词条（全拼/简拼双索引），缓存加载 %dms" % (self.size, ms))
+
+    def _load_spoken(self, dir_path):
+        """口语词频表（OpenSubtitles/SUBTLEX 融合，v3）。
+
+        简拼索引排序掺口语（initial_span：weight + spoken×60）——2026-09-06
+        主人样本钉死：丢下(38555)/没说 类口语词被 50 万级书面词（大型/大学）
+        淹没在 weight 前 32 名外，锚点/匹配通道集体失明。表缺失优雅降级。
+        """
+        self.spoken = {}
+        sp = os.path.join(dir_path, "spoken_freq.txt")
+        try:
+            with open(sp, "r", encoding="utf-8") as f:
+                for line in f:
+                    p = line.rstrip("\n").split("\t")
+                    if len(p) >= 2 and p[0]:
+                        try:
+                            self.spoken[p[0]] = int(p[1])
+                        except ValueError:
+                            pass
+        except OSError:
+            pass
+
+    def _spoken_rank(self, word, weight):
+        """简拼索引排序键：书面权重 + 口语频加权（口语词上浮）。
+
+        weight<1000 的碎片词（到现/得像 类 2gram 残片被 tencent 库收录）
+        不吃口语加成——它们靠字对频次上浮会顶掉丢下/没说 类真词
+        （2026-09-06 bydxwhm 案钉死）。
+        """
+        if weight >= 1000:
+            return weight + self.spoken.get(word, 0) * 60
+        return weight
+
+    def _is_gb_word(self, word):
+        """繁体/生僻词过滤（東西/擔心 类 tencent 库词条占核位）。"""
+        try:
+            word.encode("gb2312")
+            return True
+        except UnicodeEncodeError:
+            return False
 
     def load_dir_async(self, dir_path: str, on_done=None):
         """后台加载：输入法立即可用，底库就绪后自动上线。"""
@@ -318,11 +375,17 @@ class DictEngine:
         return out
 
     def lookup_initial(self, key_str: str, n: int = 9):
-        """简拼声母键串查询（空格分隔双拼声母键）。"""
+        """简拼声母键串查询（空格分隔双拼声母键，双拼简容错口径）。"""
+        keys = key_str.split()
         with self._lock:
-            hits = self.by_initial.get(key_str, ())
+            merged = []
+            for v in _ini_variants(keys):
+                hits = self.by_initial.get(" ".join(v))
+                if hits:
+                    merged.extend(hits)
+        merged.sort(key=lambda t: -t[0])
         out, seen = [], set()
-        for weight, word in hits:
+        for weight, word in merged:
             if word in seen:
                 continue
             seen.add(word)
@@ -330,6 +393,34 @@ class DictEngine:
             if len(out) >= n:
                 break
         return out
+
+    def initial_span(self, keys, limit=48):
+        """跨度查询（双拼简容错）：返回权重降序去重的词元组。
+
+        2026-09-06 主人样本钉死的口径现实：同一批键码里 试=sh→u
+        （nwgngdxcuyx）与 睡/上/传=sh/s 混用——简拼用户的翘舌归属本就
+        不稳定。u/i/v 是双拼正键只命中本组；s/c/z 按首字母口径同时命中
+        平舌（本键）与翘舌（双拼正键 u/i/v）两组。变体 ≤32 封顶。
+        """
+        merged = []
+        for v in _ini_variants(keys):
+            hits = self.by_initial.get(" ".join(v))
+            if hits:
+                merged.extend(hits)
+        if not merged:
+            return ()
+        merged.sort(key=lambda t: -self._spoken_rank(t[1], t[0]))
+        out, seen = [], set()
+        for _, w in merged:
+            if w in seen:
+                continue
+            seen.add(w)
+            if not self._is_gb_word(w):
+                continue  # 繁体/生僻词条不占候选名额
+            out.append(w)
+            if len(out) >= limit:
+                break
+        return tuple(out)
 
     # ---------- 自动记忆/调频 ----------
 
