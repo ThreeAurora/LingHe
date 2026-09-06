@@ -420,11 +420,16 @@ class Engine:
             if n >= 2 and n % 2 == 0:
                 py = " ".join(decode_syllable(code[i:i + 2]) for i in range(0, n, 2))
                 dict_cands += self.de.lookup_pinyin(py, self.n_pool)
-            if n >= 2 and not mb_exact:
+            if n >= 2:
                 # 简拼召回放宽到 2 键：bz→包子、mb→面包 是最高频场景，
                 # 之前 n>=3 把它们全部挡在召回之外。2 键另需更深召回：
                 # by_initial['b z'] 里 豹子 排 78（470 条含重复），默认
                 # n_pool=45 的截断把它挡在池外（主人 追上了一个bz→豹子 案）。
+                # 【2026-09-06 主人报案修复】去掉 not mb_exact 前置条件：
+                # 码表二简字命中（bz 必有）不该挡掉底库简拼召回——原条件
+                # 导致 2 键词池整个为空（动态区零候选），裁判无从复核，
+                # 包子永远出不来。码表字仍居固频区最前，底库词跟在动态区，
+                # 两区共存不冲突。
                 dict_cands += self.de.lookup_initial(" ".join(code),
                                                      90 if n == 2 else self.n_pool)
             for w in dict_cands:
@@ -461,7 +466,7 @@ class Engine:
                 # 书面门槛、max_match 的「外出旅游」贪心三路都召不回
                 # 「我吃了一个包子」。真人打真实句子时逐键字链就是目标句
                 # 本身——本通道只管召回（top6 整链进池），排序交 LLM 终审
-                vpool += self.rr.char_chains(list(code), "ini", 6)
+                vpool += self.rr.char_chains(list(code), "ini", 6, prevs=prevs)
             vpool.sort(key=lambda t: t[1] / max(1, t[2]))
             for s, c, m in vpool:
                 if s in seen:
@@ -474,13 +479,18 @@ class Engine:
         # 偏高——「的|乡村|是一项」类高频短词链每字便宜 ~2 nat，正是口语
         # 串的死因。截断会让目标句见不到神经终审（2026-09-05 实测钉死），
         # 句子全保留进池，排序交给 _on_neural 整句组纯神经裁决。
-        dict_side = [w for w, _ in ranked_pool if len(w) < 5][: self.n_pool]
-        sents_all = [w for w, _ in ranked_pool if len(w) >= 5]
+        # 码表固频区额度（2026-09-06 主人报案 bz→包子）：2 键简码时 prefix
+        # 字上百个，不设限会吃满候选池、把底库智能词全部挤出（包子在
+        # _cache_pool_scores 里却进不了 base），且 n_mb>池长让 _on_neural
+        # 的 n_mb>=len(base) 守卫直接丢弃裁判结果。固频区封顶两页半。
+        mb_part = (mb_hits + mb_prefix)[: 24]
+        n_mb = len(mb_part)
         self._cache_pool_scores = dict(ranked_pool)  # 神经精排的统计基底
-        base = (mb_hits + mb_prefix + dict_side)[: self.n_pool]
+        sents_all = [w for w, _ in ranked_pool if len(w) >= 5]
+        dict_side = [w for w, _ in ranked_pool if len(w) < 5][: self.n_pool - n_mb]
+        base = mb_part + dict_side
         seen_base = set(base)
         base += [w for w in sents_all if w not in seen_base]
-        n_mb = len(mb_hits) + len(mb_prefix)
         # AI 顺延：静态侧命中 k 个，AI 从第 k+1 位起
         merged = base[:]
         for w in self.ai.peek(self.context_key(), code):
@@ -794,6 +804,10 @@ class Engine:
         # 上屏后光标前的尾部词 = 本词 + 原上文前两个（多上文滚动的近似，
         # 免去再读一次屏幕）
         self.ctx_prevs = [word] + self.ctx_prevs[:2]
+        # 裁判上文同步滚动：ctx_tail_text 只在新码开始时读屏（caret_ctx），
+        # 自己上屏的内容若不主动拼进去，读屏失败的应用里裁判永远看不到
+        # 刚上屏的句子——接龙案（我吃了一个+bz→包子）的断点之一
+        self.ctx_tail_text = (self.ctx_tail_text + word)[-32:]
         if py:
             self.de.remember(word, py)  # 新词入库/旧词调频，批量落盘
         send_unicode(word)  # 注入事件自带 INJECTED 标志，会被钩子放行
@@ -893,6 +907,36 @@ def load_cfg(base):
         return {}
 
 
+_single_instance = None  # 持有互斥体句柄，进程存活期间不释放
+
+
+def acquire_single_instance():
+    """单实例互斥（Windows 命名互斥体）。返回 False 表示已有灵鹤在跑。
+
+    多实例叠加会装多个 WH_KEYBOARD_LL 钩子互相抢键——实测表现为
+    "只能打一个字母"（一实例吃键组码、另一实例把后续键吞掉/干扰）。
+    进程退出（含崩溃）时系统自动回收互斥体，无需显式清理。
+    """
+    global _single_instance
+    if os.name != "nt":
+        return True
+    import ctypes
+    # use_last_error=True + get_last_error()：ctypes 内部调用会污染 GetLastError，
+    # 直接 windll.kernel32.GetLastError() 读到的是残留码（曾致无实例也误判 183）
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateMutexW.restype = ctypes.c_void_p
+    k32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p]
+    ERROR_ALREADY_EXISTS = 183
+    h = k32.CreateMutexW(None, False, "Local\\LingHe_IME_SingleInstance")
+    if not h:
+        return True  # 创建失败不拦正常流程，宁可放过不可错杀
+    if ctypes.get_last_error() == ERROR_ALREADY_EXISTS:
+        k32.CloseHandle(ctypes.c_void_p(h))
+        return False
+    _single_instance = h  # 仅引用防 GC；句柄随进程销毁
+    return True
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--smoke", action="store_true", help="自检模式：加载码表/探测AI/装钩子后自动退出")
@@ -904,11 +948,19 @@ def main():
         base = os.path.dirname(os.path.abspath(sys.executable))
     else:
         base = os.path.dirname(os.path.abspath(__file__))
-    if sys.stdout is None:  # windowed 打包无控制台，print 兜底防崩
-        sys.stdout = open(os.devnull, "w", encoding="utf-8")
+    if sys.stdout is None:  # windowed 打包无控制台，写日志文件便于真机排查
+        try:
+            # 追加模式：即使第二实例瞬间启动又退出，也不截断第一实例的日志
+            sys.stdout = open(os.path.join(base, "linghe.log"), "a", encoding="utf-8", buffering=1)
+        except OSError:
+            sys.stdout = open(os.devnull, "w", encoding="utf-8")
         sys.stderr = sys.stdout
     sys.path.insert(0, base)
     cfg = load_cfg(base)
+
+    if not args.smoke and not acquire_single_instance():
+        print("[灵鹤] 已有实例在运行，本次启动自动退出（单实例互斥）")
+        return
 
     try:
         user32.SetProcessDPIAware()

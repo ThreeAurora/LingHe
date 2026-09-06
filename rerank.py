@@ -506,7 +506,7 @@ class StatReranker:
         self._char_inv_cache = inv
         return self._char_inv_cache
 
-    def char_chains(self, keys, mode="ini", n=6, beam=32, prev=""):
+    def char_chains(self, keys, mode="ini", n=6, beam=32, prev="", prevs=None):
         """口语字链召回：每键位连一个汉字，口语 unigram+char-2gram 打分，
         束搜索吐 n 条整链。
 
@@ -579,6 +579,44 @@ class StatReranker:
             out.append((s, sc, m))
             if len(out) >= n:
                 break
+        # 尾词变体（2026-09-06 主人 run.bat 报案 wilygbz 案）：字链头是准的
+        # （我吃了一个 5 字全对），但尾 2 键被 不在/被做 类高频虚词垄断——
+        # 目标句的实词尾（包子）进不了池，裁判无从裁决。两路变体兜进池，
+        # 排序全部交给 LLM 终审：
+        #   词级（有上文时）：尾 2 键底库词按 score_word 上文条件化重排——
+        #     一个→包子 的 bigram 证据压过静态频序；
+        #   字对级（无上文也能取）：尾 2 键按口语 2gram 字对频挑 top4——
+        #     (包,子) 字对频数千，纯 unigram 序里"包"排 5+ 的字对路径
+        #     被字对证据捞回（历史档案 tune_out：被做/不做 垄断案）。
+        if m >= 5 and out and self.de is not None and self.de.loaded:
+            # 头 × 尾组合：头不取 top1 单链——「出了」类高频虚链的 2gram
+            # 证据结构性压过「吃了」实词链（我出+出了 双 2gram 都强），
+            # 但目标头就在 beam 2~3 名（wilygbz 案：我吃了一个 在 top3）。
+            # 3 头 × 7 尾 ≈ 21 变体，池豁免截断、request 整句优先，量可控。
+            tail_keys = keys[-2:]
+            variants = []
+            try:
+                tail_ws = self.de.lookup_initial(" ".join(tail_keys), 40)
+            except Exception:
+                tail_ws = []
+            if prevs:
+                tail_ws.sort(key=lambda w: self.score_word(w, list(prevs)))
+            variants += [w for w in tail_ws if len(w) == 2][:3]
+            inv = self._char_inv()
+            bc = inv.get(tail_keys[0], [])[:16]
+            zc = inv.get(tail_keys[1], [])[:16]
+            if bc and zc:
+                pairs = sorted(
+                    ((self.sp2.get(a + b2, 0), a, b2) for a in bc for b2 in zc),
+                    reverse=True)[:6]
+                variants += [a + b2 for f, a, b2 in pairs if f > 0]
+            for head_s, head_sc, _ in out[:3]:
+                head = head_s[:m - 2]
+                for w in variants:
+                    v = head + w
+                    if len(v) == m and v not in seen_s:
+                        seen_s.add(v)
+                        out.append((v, head_sc + 0.5, m))
         return out
 
     def anchor_sentences(self, keys, mode="ini", n=32, prev=""):
@@ -646,8 +684,17 @@ class StatReranker:
                     # 「小吃小喝(1889)/通讯程序(1725)/误尽天下(1006)」类
                     # 低频怪词——它们占锚产出纯垃圾句；真锚西湖醋鱼(3607)/
                     # 测试一下(14305)/那个东西(9620) 全部过线（2026-09-05 实测）
-                    if self.de.weight(top_words[0]) >= ANCHOR2_FREQ:
-                        cores.append((i, i + L, top_words[0]))
+                    # 掺权序取前 2（2026-09-06 nwgngdxcuyx 案）：initial_span
+                    # 的 top1 是书面权重序（产生影响>测试一下），口语真锚
+                    # 被压——按 _spoken_rank 掺权序取两个，右侧串接才轮得到
+                    # 「测试一下」。
+                    u4 = sorted(top_words[:12],
+                                key=lambda w: -self.de._spoken_rank(
+                                    w, self.de.weight(w)))
+                    for w in u4[:3]:
+                        if self.de.weight(w) >= ANCHOR2_FREQ \
+                                or self._spoken(w) >= 480:
+                            cores.append((i, i + L, w))
                 else:
                     # 口语序去重取前 6：底库 rank 是书面语料的序（xi 组
                     # 想吃 rank11 被消除/县城/薪酬压制），口语 zipf 序里
@@ -669,7 +716,12 @@ class StatReranker:
             return []
         # 长锚优先、同长口语频优先——真锚先被轮询（东西 zipf>大学/大型，
         # 想吃 zipf 升 xi 组第 5，见 docstring 与 _spoken 注释）
-        cores.sort(key=lambda a: (-(a[1] - a[0]), -self._spoken(a[2]), a[0]))
+        # 口语频优先（2026-09-06 nwgngdxcuyx 回归案钉死）：旧的「跨度优先」
+        # 让查询缓存/赶到现场类垃圾 span4 锚排在真高频 span2 核（东西
+        # 38127）前面，把 n 名额吃光——目标句整句缺席。高频真词核先轮询：
+        # 今天(61308) 前置时想吃/西湖醋鱼 由就近串接自然带上；东西 前置
+        # 时测试一下 同理。跨度只做同频次序的 tiebreaker。
+        cores.sort(key=lambda a: (-self._spoken(a[2]), -(a[1] - a[0]), a[0]))
         # ---- 每个锚为核心：前缀 viterbi top1 + 本锚 + 右侧就近串接 ----
         out, seen_sent, seen_core = [], set(), set()
         for (ai, aj, aw) in cores:
@@ -697,6 +749,13 @@ class StatReranker:
             # 会让「集团/我就/我叫」类中等词也全展开，垃圾句挤爆候选池
             hot_core = self._spoken(aw) >= 5000
             fork_cap = 8 if hot_core else 2
+            # span4 核只产 1 句（2026-09-06 nwgngdxcuyx 回归案）：span4 垃圾
+            # 锚（新潮实业/赶到现场/感到羞耻/查询缓存）数量多且排序靠前，
+            # 每核 2 句就把 n 名额吃光——「东西」(38127) 这类真 span2 高质核
+            # 根本轮不到轮询，目标句（那我给你个东西测试一下）整句缺席。
+            # span4 特异性高、单句足够；名额让给高频 span2 核。
+            if (aj - ai) >= 3:
+                fork_cap = 1
             made_cap = fork_cap
             # FIFO 队列：先分叉的链先出句——LIFO 会让 branch-of-branch
             # 抢在前头耗尽每核心配额，正主（想吃支）饿死（实测钉死）
@@ -707,29 +766,48 @@ class StatReranker:
                 while True:
                     ahead = [a for a in cores if a[0] >= pos]
                     if not ahead:
-                        # 尾缝 top2：单键尾字歧义（h→和/好）交 LLM 终审，
-                        # 召回侧两种都给（2026-09-06 wztwsmsh 案）
-                        gap = self.viterbi(keys[pos:], mode, 2)
-                        for g in (gap or [])[:2]:
-                            if not g:
-                                continue
-                            sent = "".join(words + [g[0]])
-                            if sent not in seen_sent:
+                        if pos >= m:
+                            # 核链恰好填满全部键位（今天+想吃+西湖醋鱼=9键）：
+                            # 旧代码走 viterbi(空) 尾缝 → 空输入空产出 → 目标
+                            # 整句在最后一步被丢弃（2026-09-06 回归案：主人的
+                            # 两个验收用例 0ede592 后双双缺席的根因）
+                            sent = "".join(words)
+                            if sent and sent not in seen_sent:
                                 seen_sent.add(sent)
                                 out.append((sent, total, m))
                                 made += 1
+                        else:
+                            # 尾缝 top2：单键尾字歧义（h→和/好）交 LLM 终审，
+                            # 召回侧两种都给（2026-09-06 wztwsmsh 案）
+                            gap = self.viterbi(keys[pos:], mode, 2)
+                            for g in (gap or [])[:2]:
+                                if made >= made_cap:
+                                    break  # 尾缝 top2 不得突破核配额
+                                if not g:
+                                    continue
+                                sent = "".join(words + [g[0]])
+                                if sent not in seen_sent:
+                                    seen_sent.add(sent)
+                                    out.append((sent, total, m))
+                                    made += 1
                         break
                     nmin = min(a[0] for a in ahead)  # 就近优先
                     same = [a for a in ahead if a[0] == nmin]
                     last = words[-1] if words else ""
                     s4 = [a for a in same if a[1] - a[0] >= 3]
+                    # span4 天然优先于同位 span2（2026-09-06 nwgngdxcuyx 案
+                    # 钉死）：同位 (7,11) 的 测试一下(span4) 与 出售/从事/城市
+                    # (span2) 竞争时，bi_bonus 衔接分让 span2 组垄断——4 音节
+                    # 键串特异性远高于 2 音节，串接必须先走 span4。
                     s4.sort(key=lambda a: -self.de.weight(a[2]))
                     r2 = [a for a in same if a[1] - a[0] < 3]
                     r2.sort(key=lambda a: (-self._bi_bonus_span(last, a[2]),
                                            -self.de.weight(a[2])))
-                    main = s4[0] if s4 else (r2[0] if r2 else None)
+                    main = (s4[0] if s4 else (r2[0] if r2 else None))
                     if main is None:
                         break
+                    if s4 and main is not s4[0]:
+                        main = s4[0]  # 强制 span4 优先
 
                     def _adv(nxt, wds, fk, cur_pos=pos):
                         gw = []
@@ -742,8 +820,15 @@ class StatReranker:
                     branch = None
                     if forks > 0:
                         if hot_core and s4:
-                            # 高频核心：span4 主链之外，span2 组也全展开
-                            branches = [a for a in r2 if a is not main][:forks]
+                            # 高频核心：span4 主链之外，span2 组也全展开；
+                            # **其余 span4 变体优先入队**（2026-09-06
+                            # nwgngdxcuyx 案钉死）：产生影响/尝试一下/测试
+                            # 一下 同位 (7,11)，main 吃掉产生影响后测试一下
+                            # 作为分支必须排 span2 分支前面——排后面会被
+                            # 出售优秀/城市有效 类 span2 分支把 made_cap(8)
+                            # 名额吃光，span4 变体永远饿死。
+                            branches = list(s4[1:])
+                            branches += [a for a in r2 if a is not main][:forks]
                         else:
                             alt = r2 if s4 else r2[1:]
                             # 双支：口语组合词（想吃 3509 vs 想出 3523）频次
