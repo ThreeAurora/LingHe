@@ -46,11 +46,12 @@ PRIMER = ("<|endoftext|>我们明天去公园吧。你吃饭了吗？这个东�
 class QwenJudge:
     """Qwen2.5-0.5B 整句判别打分器 + 异步请求队列（NeuralReranker 孪生接口）。"""
 
-    def __init__(self, model_dir, log=print, max_cand=48, bs=8):
+    def __init__(self, model_dir, log=print, max_cand=72, bs=8):
         self.dir = model_dir
         self.log = log
         self.ready = False
         self.on_result = None          # 结果回调（由引擎注入）
+        self.on_ready = None           # 就绪回调（引擎用来升级在屏旧码）
         self.max_cand = max_cand       # 单次打分候选上限（CPU 耗时护栏）
         self.bs = bs
         self._q = queue.Queue()
@@ -58,6 +59,7 @@ class QwenJudge:
         self._model = None
         self._p_ids = None
         self._load_ms = 0
+        self._cache = {}               # (ctx,句)→logP：同码重打零耗时
 
     # ---------- 加载 ----------
 
@@ -70,17 +72,45 @@ class QwenJudge:
             import torch
             from transformers import AutoModelForCausalLM, AutoTokenizer
             torch.set_grad_enabled(False)
+            # GPU 优先（2026-09-07 主人判死 CPU 速度：「不可能等一个候选六
+            # 秒」——CPU int8 仍 75ms/句，fp16 GPU ~20ms/批，全池 66 句一遍
+            # ~0.3s，豆包级）。无 CUDA 再落 CPU int8。
+            self.device = "cuda" if torch.cuda.is_available() else "cpu"
             self._tok = AutoTokenizer.from_pretrained(self.dir,
                                                       trust_remote_code=True)
-            self._model = AutoModelForCausalLM.from_pretrained(
-                self.dir, trust_remote_code=True, torch_dtype=torch.float32)
-            self._model.eval()
+            try:
+                self._model = AutoModelForCausalLM.from_pretrained(
+                    self.dir, trust_remote_code=True,
+                    torch_dtype=torch.float16 if self.device == "cuda"
+                    else torch.float32)
+                # ⚠️ CPU 严禁 int8 动态量化（2026-09-07 实测钉死）：量化把
+                # logP 动态范围压塌（包子 -5.45→-6.50，被子 -11.24→-7.04，
+                # 判别分差 5.8nat→0.5nat），B 案包子从第 1 掉到第 2——
+                # 判别裁判的价值全在跨数量级的区分度上。CPU 回退保持
+                # fp32，靠收紧送裁数量（max_cand 72→20）补速度。
+                self._model.eval().to(self.device)
+            except Exception as e:
+                if self.device != "cuda":
+                    raise
+                self.log("[LLM裁判] CUDA 加载失败（%r），回退 CPU fp32" % e)
+                self.device = "cpu"
+                self._model = AutoModelForCausalLM.from_pretrained(
+                    self.dir, trust_remote_code=True, torch_dtype=torch.float32)
+                self._model.eval()
+            if self.device == "cpu":
+                self.max_cand = 20  # fp32 0.35s/句 × 20 句 ≈ 7s，保区分度
+            self.bs = 16 if self.device == "cuda" else 8
             self._p_ids = self._tok.encode(PRIMER, add_special_tokens=False)
             self.score(["预热一句"])  # 首次前向的初始化开销在加载期付掉
             self.ready = True
             self._load_ms = round((time.perf_counter() - t0) * 1000)
             self.log("[LLM裁判] Qwen2.5-0.5B 就绪 加载%dms" % self._load_ms)
             threading.Thread(target=self._worker, daemon=True).start()
+            if self.on_ready:
+                try:
+                    self.on_ready()
+                except Exception:
+                    pass
         except Exception as e:
             self.log("[LLM裁判] 加载失败（回退 RBT3/统计层）: %r" % e)
 
@@ -97,14 +127,19 @@ class QwenJudge:
         """
         if not self.ready or not cands:
             return {}
+        ctx_key = (ctx_text or "")[-16:]
+        cache = self._cache
+        out = {c: cache[(ctx_key, c)] for c in cands if (ctx_key, c) in cache}
+        miss = [c for c in cands if (ctx_key, c) not in cache]
+        if not miss:
+            return out
         tok, model, p_ids = self._tok, self._model, self._p_ids
         import torch
-        ctx_ids = tok.encode(ctx_text[-16:], add_special_tokens=False) \
-            if ctx_text else []
+        dev = self.device
+        ctx_ids = tok.encode(ctx_key, add_special_tokens=False) if ctx_key else []
         p0 = len(p_ids) + len(ctx_ids)
         seqs = [p_ids + ctx_ids + tok.encode(s, add_special_tokens=False)
-                for s in cands]
-        out = {}
+                for s in miss]
         pad = tok.pad_token_id or tok.eos_token_id
         for lo in range(0, len(seqs), self.bs):
             chunk = seqs[lo:lo + self.bs]
@@ -114,29 +149,39 @@ class QwenJudge:
             for r, s in enumerate(chunk):
                 ids[r, :len(s)] = torch.tensor(s)
                 att[r, :len(s)] = 1
-            logits = model(ids, attention_mask=att).logits
-            lsm = torch.log_softmax(logits, -1)
+            logits = model(ids.to(dev), attention_mask=att.to(dev)).logits
             for r, s in enumerate(chunk):
                 nc = len(s) - p0
                 if nc <= 0:
                     continue
-                tot = 0.0
-                for j in range(nc):
-                    tot += lsm[r, p0 + j - 1, s[p0 + j]].item()
-                out[cands[lo + r]] = tot / nc
+                # 只在候选 token 的预测位取 log_softmax（fp16 logits 先升
+                # fp32 保精度）；旧写法把整条序列在 15 万词表上全展开
+                pos = torch.arange(p0 - 1, p0 - 1 + nc, device=dev)
+                tgt = torch.tensor(s[p0:], dtype=torch.long, device=dev)
+                lp = torch.log_softmax(logits[r, pos].float(), -1)
+                v = lp[torch.arange(nc, device=dev), tgt].sum().item() / nc
+                out[miss[lo + r]] = v
+                cache[(ctx_key, miss[lo + r])] = v
+        if len(cache) > 8192:
+            cache.clear()  # 会话级缓存不做淘汰，满了整体重来
         return out
 
     # ---------- 异步请求（与 NeuralReranker 同构） ----------
 
     def request(self, code, ctx_text, cands):
         if self.ready and cands:
-            # 整句优先占名额：统计序里句子排在尾部（粗拼接值大），max_cand
-            # 截断会先把句子切掉（2026-09-06 批测钉死）——裁判的核心价值就
-            # 在整句裁决，词侧有统计+融合分兜底
+            # 整句优先占名额（2026-09-06 主人案二次钉死）：整句组是裁判的
+            # 核心价值所在，截断把它切掉＝白裁（wjtxixhcy 静态位次 57 >
+            # 旧 max_cand=48，目标句根本没进评分名单，刷新后纹丝不动）。
+            # 词侧有统计+融合分兜底，让位。
+            # ⚠️ 不做前缀去重：最小语义对（想吃/想出）恰在前 4 字内分歧，
+            # 任何前缀粗筛都会把目标句切出评分名单（v2 探针 C 组实测 FAIL）。
+            # 容量压力交给 RBT3 粗筛两级裁决（引擎 _on_nr_result）。
             sents = [c for c in cands if len(c) >= 5]
             words = [c for c in cands if len(c) < 5]
-            self._q.put((code, (ctx_text or "")[-16:],
-                         (sents + words)[:self.max_cand]))
+            sents = sents[:self.max_cand]
+            words = words[: max(0, self.max_cand - len(sents))]
+            self._q.put((code, (ctx_text or "")[-16:], sents + words))
 
     def _worker(self):
         while True:

@@ -48,6 +48,10 @@ WM_KEYUP = 0x0101
 WM_SYSKEYDOWN = 0x0104
 LLKHF_INJECTED = 0x10
 
+# 测试开关：端到端自动化验收需要注入按键驱动真实钩子链路。默认关闭——
+# 生产环境注入键照旧放行不处理，行为与旧版完全一致。
+_ACCEPT_INJECTED = bool(os.environ.get("LINGHE_ACCEPT_INJECTED"))
+
 VK_BACK, VK_ESCAPE, VK_SPACE, VK_RETURN = 0x08, 0x1B, 0x20, 0x0D
 VK_SHIFT, VK_CONTROL, VK_MENU = 0x10, 0x11, 0x12
 VK_LSHIFT, VK_RSHIFT = 0xA0, 0xA1  # 低级钩子对 Shift 上报左右原始码，不折叠成 0x10
@@ -313,9 +317,10 @@ class Engine:
         ncfg = cfg.get("neural", {})
         self.nr = NeuralReranker(os.path.join(base_dir, ncfg.get("model_dir", "ai_neural/rbt3")),
                                  log=log)
-        self.nr.on_result = self._on_neural
+        self.nr.on_result = self._on_nr_result
         self.neural_top_k = int(ncfg.get("top_k", 12))
         self.neural_lambda = float(ncfg.get("lambda", 1.0))
+        self.prune_keep = int(ncfg.get("prune_keep", 20))
         if ncfg.get("enabled", True):
             self.nr.load_async()
         else:
@@ -330,7 +335,9 @@ class Engine:
         jcfg = cfg.get("judge", {})
         self.judge = QwenJudge(os.path.join(base_dir, jcfg.get("model_dir", "ai_llm/qwen25-05b-hf")),
                                log=log)
-        self.judge.on_result = self._on_neural
+        self.judge.on_result = lambda code, scores, ms: self._on_neural(code, scores, ms, judge=True)
+        self.judge.on_ready = self._on_backend_ready
+        self.nr.on_ready = self._on_backend_ready
         if jcfg.get("enabled", True):
             self.judge.load_async()
         else:
@@ -346,6 +353,18 @@ class Engine:
             self._cache_code = None  # 底库上线，作废旧候选
             self.q.put(("flash", "[底库就绪 %d词]" % self.de.size))
             self.log("[底库] 后台加载完成：%d 词条" % self.de.size)
+            if self.buffer:  # 加载窗口里打的码立即升级重算（主人 22:34 案）
+                self._after_edit()
+
+    def _on_backend_ready(self):
+        """神经/裁判异步就绪（各自 worker 线程）：在屏旧码立即升级重判。
+
+        启动加载窗口（底库 30-45s/裁判 35s）里打字的主人案：垃圾候选会
+        永远停在屏上，除非再敲一键——后端一就绪就主动重算+重判。"""
+        if not getattr(self, "buffer", ""):
+            return
+        self.q.put(("flash", "[智能终审就绪]"))
+        self._after_edit()
 
     # ---- 候选组装：排序公式的唯一实现 ----
     def _fused_candidates(self, code):
@@ -526,7 +545,7 @@ class Engine:
         info = ctypes.cast(lparam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
         vk = info.vkCode
         self.stats["keys"] += 1
-        if info.flags & LLKHF_INJECTED:
+        if info.flags & LLKHF_INJECTED and not _ACCEPT_INJECTED:
             return user32.CallNextHookEx(None, ncode, wparam, lparam)  # 自己注入的，放行
 
         # Shift 单击：组码中=上屏已敲的英文（搜狗/微软惯例）；空码=中英切换。
@@ -712,8 +731,25 @@ class Engine:
             self.q.put(("hide",))
         return user32.CallNextHookEx(None, ncode, wparam, lparam)
 
-    def _on_neural(self, code, scores, ms):
-        """神经精排返回（worker 线程）：统计分 + λ·每字logP 重排动态区，刷新当前页。
+    def _on_nr_result(self, code, scores, ms):
+        """RBT3 返回分流（worker 线程）：裁判在位＝两级裁决的粗筛级，整句按
+        RBT3 分取 top prune_keep 转送裁判终审；裁判不在位＝兜底精排（整句组
+        保持统计序，RBT3 的新闻语料偏差不得裁决整句，见 _on_neural）。"""
+        if self.judge.ready:
+            if self.buffer != code or not scores:
+                return
+            sents = sorted(((v, w) for w, v in scores.items() if len(w) >= 5),
+                           reverse=True)
+            words = sorted(((v, w) for w, v in scores.items() if len(w) < 5),
+                           reverse=True)
+            keep = [w for _, w in sents[:self.prune_keep]] + \
+                   [w for _, w in words[:self.prune_keep]]
+            self.judge.request(code, self.ctx_tail_text, keep)
+        else:
+            self._on_neural(code, scores, ms, judge=False)
+
+    def _on_neural(self, code, scores, ms, judge=True):
+        """精排返回（worker 线程）：统计分 + λ·每字logP 重排动态区，刷新当前页。
 
         只重排池内已有的候选（MLM 打分是判别式的：不生成、只裁决）。
         buffer 已变（用户继续击键/已上屏）则丢弃本包结果。
@@ -725,23 +761,31 @@ class Engine:
         if not base or n_mb >= len(base):
             return
         tail = base[n_mb:]
-        # 整句与词分两组：整句组按**纯神经分**排序置顶。为什么不用融合式：
+        # 整句与词分两组：整句组按**纯裁判分**排序置顶。为什么不用融合式：
         # 统计代价里口语串结构性输给书面长词链 2 nat+，λ=1 的神经增益
         # (~1.2) 追不回——整句候选的价值由伪似然独立裁决（豆包式：长码
         # 用户要的就是整句，置顶展示）。词组维持统计+神经融合。
+        # ⚠️ 整句组只认 LLM 裁判：RBT3 的新闻语料偏差实测把「文件…」类
+        # 书面串顶上 top1（主人 run.bat 案 2026-09-06，B 组探针复现）——
+        # 裁判未就绪的加载窗口里整句保持统计序（宁缺毋滥），词组照常融合。
         sents = [(scores[w], w) for w in tail
                  if w in scores and w in self._cache_pool_scores and len(w) >= 5]
         words = [(self._cache_pool_scores[w] - self.neural_lambda * scores[w], w)
                  for w in tail
                  if w in scores and w in self._cache_pool_scores and len(w) < 5]
         rest = [w for w in tail if w not in scores or w not in self._cache_pool_scores]
-        sents.sort(reverse=True)   # logP 越大（越接近 0）越通顺
+        if judge:
+            sents.sort(reverse=True)   # logP 越大（越接近 0）越通顺
+            sents_ranked = [w for _, w in sents]
+        else:
+            sents_ranked = [w for w in tail
+                            if w in self._cache_pool_scores and len(w) >= 5]
         words.sort()
-        merged = base[:n_mb] + [w for _, w in sents] + [w for _, w in words] + rest
+        merged = base[:n_mb] + sents_ranked + [w for _, w in words] + rest
         self._cache_cands = merged
         self.q.put(("show", self.buffer, merged, n_mb, self._last_pos))
-        self.log("[神经] %s 精排整句%d 词%d %dms" % (
-            code, len(sents), len(words), ms))
+        self.log("[%s] %s 精排整句%d 词%d %dms" % (
+            "裁判" if judge else "RBT3", code, len(sents), len(words), ms))
 
     def _eat(self):
         self.stats["eaten"] += 1
@@ -759,11 +803,16 @@ class Engine:
             self.q.put(("show", self.buffer, cands, n_mb, pos))
         else:
             self.q.put(("think", self.buffer, pos))  # 静态零命中，AI 在途
-        # 精排：全窗口送裁（豆包式「候选自我修正」）。优先 LLM 裁判（整句
-        # 判别区分度完胜），未就绪回退 RBT3。异步不阻塞击键。
-        src = self.judge if self.judge.ready else self.nr
-        if src.ready and len(self.buffer) >= 2 and len(cands) > n_mb:
-            src.request(self.buffer, self.ctx_tail_text, cands[n_mb:])
+        # 精排直送裁判（2026-09-07 主人判死速度：「不可能等一个候选六秒」）：
+        # 裁判上 GPU fp16 后全池 66 句一遍 ~0.3s——两级粗筛（RBT3 每键 2s）
+        # 在稳态整体退役，裁判直接全量终审，整句零截断零粗筛。裁判未就绪
+        # （启动加载窗口）才回退 RBT3 词组融合（整句组保持统计序，见
+        # _on_neural 门禁）。异步不阻塞击键，worker 只留最新请求。
+        if len(self.buffer) >= 2 and len(cands) > n_mb:
+            if self.judge.ready:
+                self.judge.request(self.buffer, self.ctx_tail_text, cands[n_mb:])
+            elif self.nr.ready:
+                self.nr.request(self.buffer, self.ctx_tail_text, cands[n_mb:])
         # AI 只在长码（第 5 码起）时补位：短码静态侧（码表+底库+重排）已足够强，
         # 生成式 LLM 也物理上进不了打字节奏（200ms/字 vs 300ms+ 热调用）。
         # 整句场景有天然停顿（打完一串键才看结果），AI 300ms 能赶上。
@@ -953,13 +1002,41 @@ def main():
         base = os.path.dirname(os.path.abspath(sys.executable))
     else:
         base = os.path.dirname(os.path.abspath(__file__))
-    if sys.stdout is None:  # windowed 打包无控制台，写日志文件便于真机排查
-        try:
-            # 追加模式：即使第二实例瞬间启动又退出，也不截断第一实例的日志
-            sys.stdout = open(os.path.join(base, "linghe.log"), "a", encoding="utf-8", buffering=1)
-        except OSError:
-            sys.stdout = open(os.devnull, "w", encoding="utf-8")
-        sys.stderr = sys.stdout
+    # 日志双写：控制台在（源码 run.bat）也同步落盘 linghe.log——真机排障
+    # 需要证据（2026-09-06 主人 run.bat 案：控制台一关，现场全丢）。
+    # 追加模式：即使第二实例瞬间启动又退出，也不截断第一实例的日志
+    try:
+        _logf = open(os.path.join(base, "linghe.log"), "a", encoding="utf-8",
+                     buffering=1)
+    except OSError:
+        _logf = None
+
+    class _Tee:
+        def __init__(self, *fps):
+            self._fps = [f for f in fps if f is not None]
+
+        def write(self, s):
+            for f in self._fps:
+                try:
+                    f.write(s)
+                    f.flush()
+                except Exception:
+                    pass
+            return len(s)
+
+        def flush(self):
+            for f in self._fps:
+                try:
+                    f.flush()
+                except Exception:
+                    pass
+
+    _console = sys.stdout
+    if _console is None:  # windowed 打包无控制台
+        sys.stdout = _logf if _logf else open(os.devnull, "w", encoding="utf-8")
+    else:
+        sys.stdout = _Tee(_console, _logf) if _logf else _console
+    sys.stderr = sys.stdout
     sys.path.insert(0, base)
     cfg = load_cfg(base)
 

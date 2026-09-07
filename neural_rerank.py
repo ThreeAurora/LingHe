@@ -99,6 +99,7 @@ class NeuralReranker:
         self.sess = None
         self.provider = ""
         self.on_result = None          # 结果回调（由引擎注入）
+        self.on_ready = None           # 就绪回调（引擎用来升级在屏旧码）
         self._q = queue.Queue()
         self._load_ms = 0
 
@@ -136,6 +137,11 @@ class NeuralReranker:
             self._load_ms = round((time.perf_counter() - t0) * 1000)
             self.log("[神经] RBT3 就绪 provider=%s 加载%dms" % (self.provider, self._load_ms))
             threading.Thread(target=self._worker, daemon=True).start()
+            if self.on_ready:
+                try:
+                    self.on_ready()
+                except Exception:
+                    pass
         except Exception as e:
             self.log("[神经] 加载失败（统计层不受影响）: %r" % e)
 
