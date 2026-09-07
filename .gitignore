@@ -3,6 +3,7 @@ __pycache__/
 
 # 底库二进制缓存（可由文本词库再生，且会随词频更新频繁变化）
 dicts/.cache.bin
+dicts/.cache_mini.bin
 
 # OpenSubtitles 下载残页（404 响应体，无价值）
 cache/tmp/corpus/opensub_raw.zip
@@ -20,6 +21,9 @@ ai_llm/llama-cpu.zip
 build/
 dist/
 LingHe.spec
+
+# 环境安装包（本地 wheel 等大货，不入库）
+cache/tmp/*.whl
 
 # 大文件不入库（GitHub 100MB 上限；语料原始件可由 fetch 脚本再生，lexicon.db 是孤儿产物）
 cache/tmp/subtlex/zh_mono.txt.gz

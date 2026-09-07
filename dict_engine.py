@@ -152,7 +152,10 @@ class DictEngine:
         except OSError:
             return None
         for name in names:
-            if not (name.endswith(".yaml") or name.endswith(".txt")) or name == "user_dict.txt":
+            # user_dict/user_bigram 是用户增量（每次运行冲刷），不参与签名，
+            # 否则缓存每次启动都失效、被迫全量重建——这正是"启动加载 30s"的元凶
+            if not (name.endswith(".yaml") or name.endswith(".txt")) or \
+                    name in ("user_dict.txt", "user_bigram.txt"):
                 continue
             p = os.path.join(dir_path, name)
             try:
@@ -198,6 +201,46 @@ class DictEngine:
                 os.remove(path)  # 半成品宁可删掉，别留一个损坏缓存
             except OSError:
                 pass
+            return
+        # 顺带生成轻量缓存（下次启动秒开用）。失败不影响全量缓存。
+        try:
+            self._dump_mini(path, sig)
+        except Exception:
+            pass
+
+    def _dump_mini(self, full_path, sig, top=200000):
+        """从全量在内存数据里截 top N 高频词，重建双索引落盘 .cache_mini.bin。"""
+        import marshal
+        try:
+            top_words = [w for w, _ in
+                         sorted(self.word_weight.items(), key=lambda kv: -kv[1])[:top]]
+        except Exception:
+            return
+        bp, bi = {}, {}
+        for w in top_words:
+            py = self.word_py.get(w)
+            if not py:
+                continue
+            wt = self.word_weight.get(w, 0)
+            bp.setdefault(py, []).append((wt, w))
+            bi.setdefault(" ".join(_sm_key(s) for s in py.split()),
+                          []).append((wt, w))
+        for d in (bp, bi):
+            for k in d:
+                d[k].sort(key=lambda t: -t[0])
+        mini = {
+            "sig": sig,
+            "by_pinyin": bp,
+            "by_initial": bi,
+            "word_py": {w: self.word_py[w] for w in top_words},
+            "word_weight": {w: self.word_weight[w] for w in top_words},
+            "char_py": self.char_py,
+            "valid_sylls": self.valid_sylls,
+            "mini": True,
+        }
+        p = full_path.replace(".cache.bin", ".cache_mini.bin")
+        with open(p, "wb") as f:
+            marshal.dump(mini, f)
 
     def _after_load(self, dir_path, t0):
         """缓存命中路径：合入用户词（缓存不含 user_dict，它变化频繁）+ 日志。"""
@@ -257,17 +300,61 @@ class DictEngine:
             return False
 
     def load_dir_async(self, dir_path: str, on_done=None):
-        """后台加载：输入法立即可用，底库就绪后自动上线。"""
+        """两段式后台加载：先秒装轻量索引（high 频 top N 词，打字立即可用），
+        后台继续补全全量并原子热切换——启动等待从 60s+ 降到个位数秒。"""
         self.loading = True
 
         def work():
+            import time
+            sig = self._files_sig(dir_path)
+            if sig and self._load_mini(dir_path, sig):
+                self._after_load(dir_path, time.perf_counter())
+                # 回调加了壳：即使引擎侧回调在 __init__ 未完成时崩，
+                # 也不影响本线程继续加载全量（否则 full 热切换被跳过）
+                try:
+                    if on_done:
+                        on_done(self.loaded)
+                except Exception:
+                    pass
             try:
-                self.load_dir(dir_path)
+                self.load_dir(dir_path)   # 全量（cache 命中即热切换；无缓存则文本解析）
             finally:
                 self.loading = False
-            if on_done:
-                on_done(self.loaded)
+            try:
+                if on_done:
+                    on_done(self.loaded)
+            except Exception:
+                pass
         threading.Thread(target=work, daemon=True).start()
+
+    def _load_mini(self, dir_path, sig):
+        """加载轻量缓存（按词频截 top N 词重建的双索引，.cache_mini.bin）。
+
+        覆盖 20 万最高频词：白名单场景（女友/测试一下 类）之外的日常打字
+        高频词全部在列；marshal.load 从 246MB/68s 降到 ~15MB/几秒。
+        返回是否命中（首启无 mini 文件时 False，走全量）。"""
+        import time
+        import marshal
+        p = os.path.join(dir_path, ".cache_mini.bin")
+        t0 = time.perf_counter()
+        try:
+            with open(p, "rb") as f:
+                data = marshal.load(f)
+        except (OSError, ValueError):
+            return False
+        if data.get("sig") != sig:
+            return False
+        self.by_pinyin = data["by_pinyin"]
+        self.by_initial = data["by_initial"]
+        self.word_py = data["word_py"]
+        self.word_weight = data["word_weight"]
+        self.char_py = data["char_py"]
+        self.valid_sylls = data["valid_sylls"]
+        self.size = len(self.word_py)
+        self.loaded = True
+        self.log("[底库] 轻量索引 %d 词就绪（%.0fms，全量后台继续加载）"
+                 % (self.size, (time.perf_counter() - t0) * 1000))
+        return True
 
     # ---------- 注音 ----------
 

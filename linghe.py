@@ -248,6 +248,34 @@ class Engine:
     def __init__(self, base_dir: str, cfg: dict, log=print):
         self.log = log
         self.cfg = cfg
+        # ██ 状态字段全部最先创建：底库两段式加载的 worker 线程可能在
+        # __init__ 完成前就回执 _on_dict_ready（mini 4~9s vs init 约 20s），
+        # 缺 q/buffer/_cache_* 任何一个都会让回调崩溃、连带跳过全量热切换。
+        self.q = queue.Queue()
+        self.last_word = ""          # 上一个上屏词（bigram 学习与重排的上文）
+        self.page = 0                # 候选翻页（-/=/Tab）
+        self.n_pool = int(cfg.get("candidate_pool", 45))
+        self._cache_code = None      # compute 结果缓存（同码串复用）
+        self._cache_cands = None
+        self._cache_nmb = 0
+        self._cache_ctx = ""         # 缓存对应的上文（同码不同上文须重算）
+        self.liaison = None          # 上屏联想词列表（豆包式：上屏后提示后续词）
+        self.ctx_prevs = []          # 光标处上文词列表（tail_words 切出，最近在前；
+                                     # 豆包「指哪打哪」：多上文衰减打分的输入）
+        self.ctx_tail_text = ""      # 光标前原始文本尾部（神经重排的 MLM 输入）
+        self._last_pos = (300, 300)  # 最近候选窗位置（异步刷新时复用）
+        self._cache_pool_scores = {}  # 同池统计分缓存（神经精排的融合基底）
+        self._streak = []            # 连续上屏片段链（自动造词原料）：
+                                     # 张|布|斯 →「张布斯」；试作|古|华 →「试作古华」
+        self._streak_seen = {}       # 拼接串→连续出现次数（重复造词模式）
+        self.buffer = ""
+        self.cn_mode = True          # Shift 单击切换中/英
+        self.shift_t0 = 0
+        self.shift_alone = False
+        self.last_fg = None
+        self.context = deque(maxlen=int(cfg.get("context_max", 120)))
+        self.stats = {"keys": 0, "eaten": 0, "commits": 0, "ai_hits": 0}
+        self._hook = None
         self.max_len = int(cfg.get("max_buffer_len", 12))
         self.n_show = int(cfg.get("candidate_count", 9))
 
@@ -270,22 +298,6 @@ class Engine:
         # 端侧统计重排器（豆包第二层）：只重排底库候选，码表固频不参与
         self.rr = StatReranker(self.de, log=log)
         self.rr.load(ddir)
-        self.last_word = ""          # 上一个上屏词（bigram 学习与重排的上文）
-        self.page = 0                # 候选翻页（-/=/Tab）
-        self.n_pool = int(cfg.get("candidate_pool", 45))
-        self._cache_code = None      # compute 结果缓存（同码串复用）
-        self._cache_cands = None
-        self._cache_nmb = 0
-        self._cache_ctx = ""         # 缓存对应的上文（同码不同上文须重算）
-        self.liaison = None          # 上屏联想词列表（豆包式：上屏后提示后续词）
-        self.ctx_prevs = []          # 光标处上文词列表（tail_words 切出，最近在前；
-                                     # 豆包「指哪打哪」：多上文衰减打分的输入）
-        self.ctx_tail_text = ""      # 光标前原始文本尾部（神经重排的 MLM 输入）
-        self._last_pos = (300, 300)  # 最近候选窗位置（异步刷新时复用）
-        self._cache_pool_scores = {}  # 同池统计分缓存（神经精排的融合基底）
-        self._streak = []            # 连续上屏片段链（自动造词原料）：
-                                     # 张|布|斯 →「张布斯」；试作|古|华 →「试作古华」
-        self._streak_seen = {}       # 拼接串→连续出现次数（重复造词模式）
 
         self.ai = AIEngine(cfg.get("ai", {}), log=log)
         self.ai.on_result = lambda seq: self.q.put(("ai", seq))
@@ -326,13 +338,6 @@ class Engine:
 
         self.buffer = ""
         self.enabled = True
-        self.cn_mode = True          # Shift 单击切换中/英
-        self.shift_t0 = 0
-        self.shift_alone = False
-        self.last_fg = None
-        self.context = deque(maxlen=int(cfg.get("context_max", 120)))
-        self.q = queue.Queue()
-        self.stats = {"keys": 0, "eaten": 0, "commits": 0, "ai_hits": 0}
         self._hook = None
         self._proc = HOOKPROC(self._hook_cb)
 
