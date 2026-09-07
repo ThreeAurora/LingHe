@@ -34,12 +34,15 @@ import time
 import urllib.error
 import urllib.request
 
-# 排序提示词：只准输出候选数组，禁止解释/增删改
+# 排序提示词：只准输出 top10 数组，禁止解释/增删改。
+# 【2026-09-07 截断案】请求名单必须含全量动态真词池（包子静态 33 位，
+# 只传前 24 等于没发——云端不是神仙）；模型只回 top10：输出越短越快，
+# 未上榜词保持统计原序（_on_cloud_rank 落位规则）。
 SYSTEM_PROMPT = (
     "你是中文输入法的候选排序助手。用户正在输入法里打字，给出了一串输入编码和"
-    "一组候选（词或句子）。请把候选按「用户此刻最可能想输入的内容」从高到低"
-    "排序。只输出一个 JSON 字符串数组，数组元素必须是候选原文，一个不多一个不少"
-    "，禁止任何解释、拼音或注释。"
+    "一组候选（词或句子）。请结合上文，把候选中「用户此刻最可能想输入的」前 10 个"
+    "按可能性从高到低挑出来。只输出一个 JSON 字符串数组（最多 10 个元素，元素必须"
+    "是候选原文），禁止任何解释、拼音或注释。"
 )
 
 USER_PROMPT = (
@@ -241,7 +244,9 @@ class CloudJudge:
                         code=code, cands=json.dumps(cands, ensure_ascii=False))},
                 ],
                 "temperature": 0.0,
-                "max_tokens": 400,
+                # 24 个候选的 JSON 数组 ~100 token：max_tokens 越大模型越可能
+                # 拖尾拉长响应（生成通道 1567ms 案同因）。120 足够且更快。
+                "max_tokens": 120,
                 "stream": False,
             }
             resp = _post_json(
@@ -263,12 +268,15 @@ class CloudJudge:
     # ---------- 异步请求（与 QwenJudge 同构） ----------
 
     def request(self, code, ctx_text, cands):
-        """排序通道：从候选池里挑最可能（判别式，豆包第二层）。"""
+        """排序通道：从候选池里挑最可能（判别式，豆包第二层）。
+
+        名单须含全量动态真词池（包子静态 33 位案：截断=云端没机会）；
+        模型只回 top10，输出短、回得快。"""
         if self.ready and cands:
-            # 整句优先占名额（与 QwenJudge 同策略）：整句是裁判核心价值。
+            # 整句优先占名额：整句是裁判核心价值
             sents = [c for c in cands if len(c) >= 5]
             words = [c for c in cands if len(c) < 5]
-            sents = sents[: self.max_cand]
+            sents = sents[: self.max_cand // 2]
             words = words[: max(0, self.max_cand - len(sents))]
             self._q.put(("rank", code, (ctx_text or "")[-32:], sents + words))
 

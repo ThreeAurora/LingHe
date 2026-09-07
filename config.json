@@ -25,13 +25,13 @@
     "prune_keep": 20
   },
   "judge": {
-    "enabled": false,
+    "enabled": true,
     "model_dir": "ai_llm/qwen25-05b-hf",
     "api_base": "https://ark.cn-beijing.volces.com/api/v3",
     "api_key": "ark-0f50fb39-bad5-46d6-bc55-c161beec5dd1-7fbc7",
     "model": "doubao-seed-2-0-lite-260428",
-    "timeout": 8.0,
-    "max_cand": 30
+    "timeout": 4.0,
+    "max_cand": 64
   },
   "mabiao_dir": "mabiao",
   "max_buffer_len": 14,

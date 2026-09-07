@@ -467,6 +467,7 @@ class Engine:
         jcfg = cfg.get("judge", {})
         self.cloud_judge = CloudJudge(jcfg, log=log)
         self.cloud_judge.on_generate = self._on_cloud_generate
+        self.cloud_judge.on_result = self._on_cloud_rank
         self.cloud_judge.on_ready = self._on_backend_ready
         if jcfg.get("enabled", True) and jcfg.get("api_key"):
             self.cloud_judge.load_async()
@@ -1265,6 +1266,31 @@ class Engine:
         self.log("[%s] %s 精排整句%d 词%d %dms" % (
             "裁判" if judge else "RBT3", code, len(sents), len(words), ms))
 
+    def _on_cloud_rank(self, code, scores, ms):
+        """云端排序返回（worker 线程）：动态区按云端语义序整体重排。
+
+        与生成通道的分水岭（2026-09-07 主人「0.2s」案定形）：排序只动
+        池内词的次序——候选都是本地召回的、音码全对得上，云端只挑语义，
+        零幻觉风险（纯生成实测 wjtxixhcy 全解错音，只配做补充）。
+        固频区不动（肌肉记忆），四码契约不受影响（重排只在 n_mb 之后）。
+        """
+        if self.buffer != code or not scores:
+            return
+        base = self._cache_cands
+        n_mb = self._cache_nmb
+        if not base or n_mb >= len(base):
+            return
+        tail = base[n_mb:]
+        # 云端确证的词按它给的序浮起；未上榜词保持统计原序（不是沉底——
+        # 云端只回 top10，剩下的 70+ 词沉底会毁掉静态层的完整排序）
+        hit = sorted((w for w in tail if w in scores),
+                     key=lambda w: -scores[w])
+        ranked = hit + [w for w in tail if w not in scores]
+        merged = base[:n_mb] + ranked
+        self._cache_cands = merged
+        self.q.put(("show", self.buffer, merged, n_mb, self._last_pos))
+        self.log("[云端排序] %s %dms 首位=%s" % (code, ms, merged[n_mb]))
+
     @staticmethod
     def _cloud_norm(s):
         """去拼音声调/变体：bǎo→bao、zhèng→zheng、lǜ→lv。留 a-z 和 v。"""
@@ -1430,6 +1456,16 @@ class Engine:
             # ~1.4s 到后升级首选——绝不回落本地垃圾排序。
             if self.cloud_judge.ready:
                 self.cloud_judge.request_generate(self.buffer, self.ctx_tail_text)
+                # 排序通道（2026-09-07 接线）：候选音码本地已对好，云端只挑
+                # 语义零幻觉——生成实测全解错音（wjtxixhcy→我今天下午去），
+                # 生成只配做池外补充且必须过 _cloud_code_ok。2 键起就发
+                # （bz 接龙是主人核心用例，动态区 25 位的包子要靠云端顶起），
+                # 打码途中每键预发、worker 只留最新——打完最后一键时请求
+                # 早已在途，云端答案 ~1s 内落位升级。
+                if self._cache_dynscore:
+                    self.cloud_judge.request(
+                        self.buffer, self.ctx_tail_text,
+                        self._cache_dynscore[:64])
         # AI 只在长码（第 5 码起）时补位：短码静态侧（码表+底库+重排）已足够强，
         # 生成式 LLM 也物理上进不了打字节奏（200ms/字 vs 300ms+ 热调用）。
         # 整句场景有天然停顿（打完一串键才看结果），AI 300ms 能赶上。
