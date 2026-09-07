@@ -1714,6 +1714,18 @@ def main():
 
     if not args.smoke and not acquire_single_instance():
         print("[灵鹤] 已有实例在运行，本次启动自动退出（单实例互斥）")
+        # 【2026-09-07 主人「run.bat 启动闪退」案】start 起的常驻控制台
+        # 一闪而过，静默退出看起来就是闪退（主人双击时旧实例还活着）。
+        # 弹窗告知真相：输入法其实能用；要重启先关旧窗口。
+        try:
+            ctypes.windll.user32.MessageBoxW(
+                None, "灵鹤已经在运行中，本次启动取消。\n\n"
+                      "候选窗没出来的话：旧实例可能只剩后台进程——\n"
+                      "请先结束旧的灵鹤控制台窗口（或任务管理器结束 python），\n"
+                      "再双击 run.bat 即可正常启动。",
+                "灵鹤 LingHe", 0x40)
+        except Exception:
+            pass
         return
 
     try:
