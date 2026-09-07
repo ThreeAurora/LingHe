@@ -25,6 +25,9 @@ LingHe.spec
 # 环境安装包（本地 wheel 等大货，不入库）
 cache/tmp/*.whl
 
+# 探针/遗留文件归档（探针脚本、Ark 调试件、接龙联想生成物等，一次性使用后归档）
+cache/archive/
+
 # 大文件不入库（GitHub 100MB 上限；语料原始件可由 fetch 脚本再生，lexicon.db 是孤儿产物）
 cache/tmp/subtlex/zh_mono.txt.gz
 dicts/lexicon.db
