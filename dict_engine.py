@@ -71,6 +71,7 @@ class DictEngine:
         self.loaded = False
         self.loading = False
         self.user_dict_path = None
+        self.spoken = {}            # 口语词频表（_load_spoken 填充；先置空防加载前访问崩）
         self._lock = threading.Lock()
         self._dirty = {}         # word -> count，待落盘的用户词（批量写，减少 IO）
         self._since_flush = 0

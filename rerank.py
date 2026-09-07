@@ -157,6 +157,11 @@ class StatReranker:
         except OSError:
             pass
         self._build_next_index()
+        # 口语 2/3gram 预加载（2026-09-07 主人「完全不可用」案）：击键路径
+        # 的 char_chains/_eval_sent 不再允许 lazy 加载——首次 9 键简拼会卡钩子
+        # 线程 1.5 秒。启动时一次性读入，打字永不卡。
+        self._load_sp2()
+        self._load_sp3()
         return n
 
     def _spoken(self, w):
@@ -405,6 +410,27 @@ class StatReranker:
                 pass
         return self.sp3
 
+    def _load_sp2(self):
+        """口语 char-2gram（char_chains 用）。load() 预加载——char_chains
+        在击键路径（_after_edit→compute）里，若在首次 9 键简拼时才加载，
+        钩子线程会被 3.2MB 逐行解析卡 1.5 秒（2026-09-07 主人「完全不可用」
+        案钉死），整个键盘冻结。启动一次性代价换打字永不卡。"""
+        if self.sp2 is None:
+            self.sp2 = {}
+            p2 = os.path.join(self.dir, "spoken_2gram.txt")
+            try:
+                with open(p2, "r", encoding="utf-8") as f:
+                    for line in f:
+                        p = line.split()
+                        if len(p) >= 2:
+                            try:
+                                self.sp2[p[0]] = int(p[1])
+                            except ValueError:
+                                pass
+            except OSError:
+                pass
+        return self.sp2
+
     def _eval_sent(self, s):
         """整句证据分 [0,1]。1.0=词典整词（菌类植物/测试一下）；其余按口语
         3gram 命中率 + 最长连续命中 - 单字孤串罚。
@@ -419,7 +445,7 @@ class StatReranker:
         3gram 证据，两者同构，统计层无法区分——按伪句深水处理（翻页可见），
         语义终审（裁判）只裁分数达标的句子，避免再给垃圾背书。"""
         n = len(s)
-        if n < 5:
+        if n < 4:
             return 0.0
         if self.de.word_py.get(s) and self.de.weight(s) > 0:
             return 1.0
@@ -444,6 +470,19 @@ class StatReranker:
         elif orphan >= 2:
             ev -= 0.5
         return max(0.0, min(1.0, ev))
+
+    def _clean_chain(self, s):
+        """零孤字词链：整句可拆成纯多字词典词（史诗级|对决），无单字残渣。
+
+        2026-09-07 主人 uiuijidvjt（史诗级对决）案：整句闸（EV_SENT_GOOD）
+        只认口语 3gram 证据，而 3+2/2+3 拆法的 5 字短语中间那个跨词 3gram
+        （史级对）天然是语料里的词间残渣——证据分结构性上不了 0.55，真短语
+        （史诗级对决 ev0）与拼字伪句（是十几对绝 ev0）同分，被整段挡在候选
+        外。零孤字链是两者之间唯一的可计算分界：真短语=词典词干净拼接，
+        伪句带单字残渣（是/对/绝）。只对整句闸放行（进候选池尾部），不替代
+        统计排序，也不进裁判名单。
+        """
+        return all(len(w) >= 2 for w in self._cut_words(s))
 
     # ---------- 整句切分（Viterbi / beam search）----------
 
@@ -605,18 +644,7 @@ class StatReranker:
         m = len(keys)
         if m < 4 or m > MAX_KEYS:
             return []
-        if self.sp2 is None:
-            self.sp2 = {}
-            p2 = os.path.join(self.dir, "spoken_2gram.txt")
-            if os.path.isfile(p2):
-                with open(p2, "r", encoding="utf-8") as f:
-                    for line in f:
-                        p = line.split()
-                        if len(p) >= 2:
-                            try:
-                                self.sp2[p[0]] = int(p[1])
-                            except ValueError:
-                                pass
+        self._load_sp2()  # load() 已预加载，此处仅兜底（旧进程/直用模块时）
         inv = self._char_inv()
         states = [(0.0, "", "")]
         for k in keys:
