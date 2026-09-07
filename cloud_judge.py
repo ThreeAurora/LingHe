@@ -56,13 +56,26 @@ USER_PROMPT = (
 # 编码两种形态都要认：简拼=每键一声母（wjtx=我今天想），双拼=每 2 键一音节。
 # 2026-09-07 探针钉死：把 wjtxixhcy 当双拼解码会出「我今天下午去」这类
 # 音不对的答案；明确声明简拼后模型才能对号入座。
+# 2026-09-07 二修（主人「没联想词语和纯双拼」案）：只给声母映射时，双拼
+# 词码 wm=我们 模型解不出韵母返回空——补齐完整小鹤双拼键位（声母+韵母+
+# 零声母），并给出「奇数键=简拼 / 偶数键=双拼（兼简拼词）」的判定规则。
 GEN_SYSTEM = (
-    "你是中文输入法。用户用简拼（每键一声母）或双拼（每 2 键一音节）打字。\n"
-    "小鹤声母映射：i=吃(ch) u=是(sh) v=之(zh)，其余键是普通声母（如 w=我 j=今 t=天）。\n"
-    "示例：编码 wjtxixhcy = 我今天想吃西湖醋鱼（w我 j今 t天 x想 i吃 x西 h湖 c醋 y鱼）。\n"
-    "请结合上文和常识，直接写出用户此刻最可能想输入的内容，1 到 3 个候选，按可能性"
-    "从高到低。候选必须通顺、读音与编码对应。只输出一个 JSON 字符串数组，禁止任何"
-    "解释、拼音或注释。"
+    "你是中文输入法，负责把输入编码转成用户想打的词或句子。\n"
+    "编码有两种形态：\n"
+    "1. 简拼：每键一声母。zh/ch/sh 分别用 v/i/u 键，其余键即声母本身。\n"
+    "   例1：wjtxixhcy = w我 j今 t天 x想 i吃 x西 h湖 c醋 y鱼 = 我今天想吃西湖醋鱼。\n"
+    "   例2：ilyg = i出(ch) l来 y一 g个 = 出来一个（注意：i 键表示声母 ch，不是 y）。\n"
+    "2. 双拼（小鹤）：每 2 键一个完整音节。声母键：v=zh i=ch u=sh，其余键即声母。\n"
+    "   韵母键：q=iu w=ei e=e r=uan t=ue y=un u=u i=i o=uo p=ie a=a s=ong d=ai\n"
+    "   f=en g=eng h=ang j=an k=ing l=iang z=ou x=ia c=ao v=ui b=in n=iao m=ian。\n"
+    "   零声母两键：aa=a oo=o ee=e er=er ai=ai ei=ei ou=ou ao=ao an=an en=en。\n"
+    "判定：奇数键=简拼（按声母逐字读）；偶数键=双拼整音节，同时可作简拼词解读"
+    "（如 wm=我们/外贸 是简拼；纯双拼例：wj=w+an=晚/万、pb=p+in=拼、ul=sh+uang=双）。\n"
+    "硬性要求：输出的每个字，其读音必须与编码严格对应——简拼时每键是该字声母"
+    "（ch→i 键、zh→v 键、sh→u 键），双拼时每 2 键解码后正好是该字拼音。"
+    "任何一个字对不上编码就整条作废。宁缺毋滥：解不出就输出空数组 []。\n"
+    "请结合上文（若有）和常识，输出用户此刻最可能想打的 1 到 3 个词或句子，"
+    "按可能性从高到低。只输出一个 JSON 字符串数组，禁止任何解释、拼音或注释。"
 )
 
 GEN_PROMPT = (
@@ -148,28 +161,39 @@ class CloudJudge:
         threading.Thread(target=self._load, daemon=True).start()
 
     def _load(self):
-        """小请求验证 key/model/base 连通。成功才置 ready。"""
+        """小请求验证 key/model/base 连通。成功才置 ready。
+
+        2026-09-07 探针案：启动瞬间网络未就绪/偶发超时会让探测一次失败就
+        永久停用（回落本地），云端能力整个消失；且启动期底库全量加载（99s）
+        霸占 GIL，网络线程 8s 超时必饿死。改为 10s 间隔宽松重试直到成功
+        （最多 5 分钟，远超 99s 加载窗），连续探测失败只记日志。
+        """
         if not (self._base and self._key and self._model):
             self.log("[云端裁判] 未配置 api_base/api_key/model，停用（回落本地）")
             return
-        try:
-            t0 = time.perf_counter()
-            ordered = self._call_gen("wjtx", "")  # 生成通道探测：一个双拼整词码
-            self._probe_ms = round((time.perf_counter() - t0) * 1000)
-            if ordered:
-                self.ready = True
-                self.log("[云端裁判] 就绪 %s 模型=%s 探测%dms" %
-                         (self._base, self._model, self._probe_ms))
-                threading.Thread(target=self._worker, daemon=True).start()
-                if self.on_ready:
-                    try:
-                        self.on_ready()
-                    except Exception:
-                        pass
-            else:
-                self.log("[云端裁判] 探测无输出，停用（回落本地）")
-        except Exception as e:
-            self.log("[云端裁判] 探测失败（回落本地）: %r" % e)
+        attempt = 0
+        while attempt < 30:
+            attempt += 1
+            try:
+                t0 = time.perf_counter()
+                ordered = self._call_gen("wjtx", "")  # 生成通道探测：一个双拼整词码
+                self._probe_ms = round((time.perf_counter() - t0) * 1000)
+                if ordered:
+                    self.ready = True
+                    self.log("[云端裁判] 就绪 %s 模型=%s 探测%dms" %
+                             (self._base, self._model, self._probe_ms))
+                    threading.Thread(target=self._worker, daemon=True).start()
+                    if self.on_ready:
+                        try:
+                            self.on_ready()
+                        except Exception:
+                            pass
+                    return
+                self.log("[云端裁判] 探测第 %d 次无输出，10s 后重试" % attempt)
+            except Exception as e:
+                self.log("[云端裁判] 探测第 %d 次失败（10s 后重试）: %r" % (attempt, e))
+            time.sleep(10)
+        self.log("[云端裁判] 5 分钟仍未就绪，停用（回落本地）")
 
     # ---------- 排序 ----------
 
@@ -312,7 +336,9 @@ class CloudJudge:
                         ctx=(ctx_text or "")[-120:] or "（无）", code=code)},
                 ],
                 "temperature": 0.0,
-                "max_tokens": 200,
+                # 1~3 个短候选用不了 200 token：max_tokens 越大，模型越可能
+                # 拖尾生成多余内容拉长响应（1567ms 案）。80 足够且更快。
+                "max_tokens": 80,
                 "stream": False,
             }
             resp = _post_json(

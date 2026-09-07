@@ -1,4 +1,8 @@
 {
+  "gram": {
+    "enabled": true,
+    "model": "E:/AAAAA/wanxiang-lts-zh-hans.gram"
+  },
   "ai": {
     "enabled": false,
     "mode": "auto",
@@ -14,14 +18,14 @@
     "temperature": 0.2
   },
   "neural": {
-    "enabled": true,
+    "enabled": false,
     "model_dir": "ai_neural/rbt3",
     "top_k": 48,
     "lambda": 1.0,
     "prune_keep": 20
   },
   "judge": {
-    "enabled": true,
+    "enabled": false,
     "model_dir": "ai_llm/qwen25-05b-hf",
     "api_base": "https://ark.cn-beijing.volces.com/api/v3",
     "api_key": "ark-0f50fb39-bad5-46d6-bc55-c161beec5dd1-7fbc7",
@@ -30,7 +34,7 @@
     "max_cand": 30
   },
   "mabiao_dir": "mabiao",
-  "max_buffer_len": 12,
+  "max_buffer_len": 14,
   "candidate_count": 9,
   "candidate_pool": 90,
   "context_max": 120
