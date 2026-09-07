@@ -75,6 +75,19 @@ class DictEngine:
         self._dirty = {}         # word -> count，待落盘的用户词（批量写，减少 IO）
         self._since_flush = 0
 
+    @staticmethod
+    def _norm_py(py: str) -> str:
+        """拼音键规范化：剥离声调（pì yě → pi ye），兼容词库带调/无调混存。
+
+        词库拼音有的带调（pì yě）有的不带（pi ye），直接当键会导致无调键
+        查不到带调词条——piye 简拼永远出不来 屁也（2026-09-07 报案）。NFD
+        分解出组合声调符号后剔除，对无调拼音是零开销恒等。
+        """
+        import unicodedata
+        return "".join(
+            ch for ch in unicodedata.normalize("NFD", py)
+            if not unicodedata.combining(ch))
+
     # ---------- 加载 ----------
 
     def load_dir(self, dir_path: str) -> int:
@@ -123,8 +136,9 @@ class DictEngine:
             word_py[word] = py
             if weight > word_weight.get(word, 0):
                 word_weight[word] = weight
-            by_pinyin.setdefault(py, []).append((weight, word))
-            ini = " ".join(_sm_key(s) for s in py.split())
+            k = self._norm_py(py)  # 键去声调：词库 pì yě 与查询 pi ye 才对得上
+            by_pinyin.setdefault(k, []).append((weight, word))
+            ini = " ".join(_sm_key(s) for s in k.split())
             by_initial.setdefault(ini, []).append((weight, word))
         for d in (by_pinyin, by_initial):
             for k in d:
@@ -163,7 +177,9 @@ class DictEngine:
                 out.append((name, st.st_size, int(st.st_mtime)))
             except OSError:
                 return None
-        return tuple(out)
+        # 索引口径版本号：代码改了键生成规则（如拼音去声调）时 bump，
+        # 强制旧缓存失效重建，否则缓存里还是旧键查不到新词。
+        return tuple(out) + (("index_ver", 4),)
 
     def _load_cache(self, path, sig):
         try:
@@ -250,8 +266,9 @@ class DictEngine:
             if w not in self.word_py:
                 self.word_py[w] = p
                 self.word_weight[w] = 0
-                self.by_pinyin.setdefault(p, []).append((100000 + c, w))
-                self.by_initial.setdefault(" ".join(_sm_key(s) for s in p.split()), []).append((100000 + c, w))
+                k = self._norm_py(p)
+                self.by_pinyin.setdefault(k, []).append((100000 + c, w))
+                self.by_initial.setdefault(" ".join(_sm_key(s) for s in k.split()), []).append((100000 + c, w))
                 self.size += 1
         self._load_spoken(dir_path)
         self.loaded = True

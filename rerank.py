@@ -96,6 +96,7 @@ class StatReranker:
         self._viterbi_cache = {}
         self._cache_ver = 0       # bigram 变化时自增，作废旧缓存
         self.sp2 = None           # 口语 char-2gram（char_chains 懒加载）
+        self.sp3 = None           # 口语 char-3gram（sentence_evidence 懒加载）
         self._char_inv_cache = None
         self.dir = ""             # dicts 目录（char_chains 找 spoken_2gram 用）
 
@@ -363,6 +364,86 @@ class StatReranker:
         prev_word: str 或多词 list（多上文衰减，见 _bi_bonus_multi）。
         """
         return self._cost(word) - self._bi_bonus_multi(prev_word, word)
+
+    # ---------- 句子真伪判定（拼装伪句深水闸）----------
+
+    def _cut_words(self, s):
+        """贪心最长词典词切分（仅用于句子证据统计，非排序路径）。
+
+        万象词库里「教育了我/我正/就一」这种自然二连字组合全被收成了词，
+        所以「切词+词间断裂」判据挡不住拼装伪句；本方法只贡献「单字孤串」
+        信号（伪句后半段常有孤立高频字：成了/是/上）。"""
+        words, i, n = [], 0, len(s)
+        while i < n:
+            got = None
+            for L in (5, 4, 3, 2):
+                if i + L <= n:
+                    w = s[i:i + L]
+                    if self.de.word_py.get(w) and self.de.weight(w) > 0:
+                        got = w
+                        break
+            if got is None:
+                got = s[i]
+            words.append(got)
+            i += len(got)
+        return words
+
+    def _load_sp3(self):
+        if self.sp3 is None:
+            self.sp3 = {}
+            p3 = os.path.join(self.dir, "spoken_3gram.txt")
+            try:
+                with open(p3, "r", encoding="utf-8") as f:
+                    for line in f:
+                        p = line.split()
+                        if len(p) >= 2:
+                            try:
+                                self.sp3[p[0]] = int(p[1])
+                            except ValueError:
+                                pass
+            except OSError:
+                pass
+        return self.sp3
+
+    def _eval_sent(self, s):
+        """整句证据分 [0,1]。1.0=词典整词（菌类植物/测试一下）；其余按口语
+        3gram 命中率 + 最长连续命中 - 单字孤串罚。
+
+        背景（2026-09-07 主人 jylwviwu 案）：viterbi/锚点把高频虚词拼成
+        「教育了我正成为是」（每音节统计价 -14.4 反超真词菌类植物 -12.6），
+        按 unigram 均价排序就霸屏。真句（语料里真有人说）的 3gram 命中明显
+        高于虚词拼接——本分只用于「句子分级」（强句进前排、弱句沉后、伪句
+        深水 + 不进裁判名单），**不替代统计排序**。
+
+        已知盲区：专名组合（武媚娘传奇 0.0、教育论文忠诚卫士 0.0）无口语
+        3gram 证据，两者同构，统计层无法区分——按伪句深水处理（翻页可见），
+        语义终审（裁判）只裁分数达标的句子，避免再给垃圾背书。"""
+        n = len(s)
+        if n < 5:
+            return 0.0
+        if self.de.word_py.get(s) and self.de.weight(s) > 0:
+            return 1.0
+        sp3t = self._load_sp3()
+        total = n - 2
+        hit, run, best = 0, 0, 0
+        for i in range(total):
+            if sp3t.get(s[i:i + 3], 0):
+                hit += 1
+                run += 1
+                if run > best:
+                    best = run
+            else:
+                run = 0
+        if total < 2:
+            return 0.0
+        rate = hit / total
+        orphan = sum(1 for w in self._cut_words(s) if len(w) == 1)
+        ev = 0.5 * rate + (0.15 if best >= 2 else 0.0)
+        if orphan >= 1:
+            ev -= 0.2
+        elif orphan >= 2:
+            ev -= 0.5
+        return max(0.0, min(1.0, ev))
 
     # ---------- 整句切分（Viterbi / beam search）----------
 
