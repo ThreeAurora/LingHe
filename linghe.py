@@ -25,6 +25,8 @@ from collections import deque
 import tkinter as tk
 
 from ai_engine import AIEngine
+from ai_llm_judge import QwenJudge
+from cloud_judge import CloudJudge
 from candidate_ui import CandidateWindow
 from dict_engine import DictEngine
 from fuma import FuMa
@@ -62,12 +64,12 @@ VK_OEM_1 = 0xBA    # ; :
 VK_OEM_7 = 0xDE    # ' "
 VK_OEM_MINUS = 0xBD  # - _（上一页）
 VK_OEM_PLUS = 0xBB   # = +（下一页）
+VK_CAPITAL = 0x14    # CapsLock（大写锁定）
 
 PUNCT_VKS = {
     0xBC,  # , <
     0xBE,  # . >
     0xBF,  # / ?
-    0xC0,  # ` ~
     0xDB, 0xDC, 0xDD,  # [ \
 }
 
@@ -80,6 +82,27 @@ COIN_BLOCK = set("的地得了吗呢吧啊呀哦呗嘛啦咯喽嗯哪哇噢喔�
 COIN_MAX = 5      # 造词最长字数（专名/短语上限）
 COIN_MULTI_MAX = 50000  # 混合模式里多字词片段的词频上限：超过算「句子里的
                         # 常用词」（东西/测试/一下），不算专名词头（试作）
+
+# 高频功能字（2026-09-07 主人「穗心」案）：尾 2 字组合里只要含任何一个，
+# 就是句子流顺手逐字打的（我|打、个|一、就|是、不|会），不是专名——不造。
+# 专名（穗心/张阔/武媚娘）的两个字都不在功能字表里，照常造。
+COIN_COMMON = set("的了是我你一不就都在和也他她它咱们俩有出着过被把让向从到对就这那还又要于与及各等给可没上正来去说想看看听问叫找打知道能会该要和得到我吗您请谢谢。，！？、、；：—…·")
+
+# 候选装配参数（2026-09-07 主人 jylwviwu「菌类植物」案定案）：
+WORD_BOOST = 9.0         # 全码整词提权：用户打满整词音节（菌类植物 4 音对
+                         # 4 音），这个词就是目标本身——低频真词（-12.6/音节）
+                         # 要压过高频虚词拼装的伪句（-14.4 更省，见 probe_junlei），
+                         # 「先出词、后拼句」是输入法的本分。
+LONGWORD_MIN_A = 40      # 3~4 音节真词进第一屏的最低权重闸。万象词库把
+                         # 「菌类职务/菌类织物/菌类之屋」这类自然二连字垃圾
+                         # 组合收成词，简拼全码召回归来一大把——低权长词
+                         # 不给前排坑位，深水翻页可见。
+EV_SENT_GOOD = 0.55      # 句子证据分阈值（StatReranker._eval_sent）：
+                         # >= 视为真句（进前排/裁判名单），< 沉深水（不送裁判）。
+                         # 0.4 太松：3gram 碎片句（就有了我这车晚上 0.40 /
+                         # 就有了我这成为时 0.48）同分混进真句（我吃了一个
+                         # 包子 0.55 / 今天天气不错 0.65）——碎片句 rate≈0.5
+                         # +best3 恰好卡 0.4，升闸即清零。
 
 
 def coin_pick(streak, seen, de):
@@ -113,8 +136,6 @@ def coin_pick(streak, seen, de):
     if len(head) >= 2 and de.weight(head) >= COIN_MULTI_MAX:
         return None
     for k in range(len(streak), 1, -1):
-        if k == 2 and len(streak) != 2:
-            continue  # 2 字组合只认整链（防长链尾部中间态误造）
         frags = streak[-k:]
         s = "".join(w for w, _ in frags)
         n = len(s)
@@ -132,7 +153,13 @@ def coin_pick(streak, seen, de):
         seen[s] = seen_n + 1
         ok = False
         if not multi:
-            ok = True  # 纯单字 2~5 字：主人拍板全造
+            # 纯单字链：只造短组合（<=2 字）。聊天时逐字上屏的碎片
+            # （原谅|我|我|打、浓茶|弄|成|有）是句子流不是专名——
+            # 3 字以上纯单字链一律不自动造，只在重复出现时兜底造。
+            # 尾 2 字组合单字含高频功能字（我|打、个|一）也不造。
+            ok = n <= 2 or seen_n >= 1
+            if ok and n == 2 and any(ch in COIN_COMMON for ch in s):
+                ok = False
         elif singles and all(de.weight(m) < COIN_MULTI_MAX for m in multi):
             ok = True  # 生僻词头+单字：专名模式（试作|古|华）
         elif seen_n >= 1:
@@ -328,19 +355,24 @@ class Engine:
         else:
             log("[神经] 已按配置停用（neural.enabled=false）")
 
-        # LLM 终审裁判（Qwen2.5-0.5B 整句判别，2026-09-05 接棒 RBT3）：
-        # RBT3 的新闻语料偏差是实测天花板（文件体现出西湖醋鱼 -7.86 压过
-        # 我今天想吃西湖醋鱼 -9.21）；Qwen 在口语语料上预训练，判别式整句
-        # logP 完胜（-3.52 vs -5.34）。生成式 0.5B 不行（五种 prompt 束搜索
-        # 全败），判别式 0.5B 实测两验收用例双双登顶。就绪后接管精排请求，
-        # 未就绪时回退 RBT3——回调与分数方向量纲完全兼容（每字 logP）。
+        # 终审裁判两级：云端大模型（豆包式生成首选）→ 本地 Qwen2.5-0.5B。
+        # 2026-09-07 主人「真正的智能」案定音：排序是判别式（候选池里挑，
+        # 池里没有的永远出不来），生成是写答案（简拼整句首选只能靠生成）。
+        # 配置了 api_key → 云端生成通道接管首选；否则回落本地判别裁判。
+        # 回调与分数方向量纲完全兼容（每字 logP）。
         jcfg = cfg.get("judge", {})
         self.judge = QwenJudge(os.path.join(base_dir, jcfg.get("model_dir", "ai_llm/qwen25-05b-hf")),
                                log=log)
         self.judge.on_result = lambda code, scores, ms: self._on_neural(code, scores, ms, judge=True)
         self.judge.on_ready = self._on_backend_ready
         self.nr.on_ready = self._on_backend_ready
-        if jcfg.get("enabled", True):
+        self.cloud_judge = CloudJudge(jcfg, log=log)
+        self.cloud_judge.on_generate = self._on_cloud_generate
+        self.cloud_judge.on_ready = self._on_backend_ready
+        if jcfg.get("enabled", True) and jcfg.get("api_key"):
+            self.cloud_judge.load_async()
+        elif jcfg.get("enabled", True):
+            log("[云端裁判] 未配置 api_key，使用本地 QwenJudge")
             self.judge.load_async()
         else:
             log("[LLM裁判] 已按配置停用（judge.enabled=false）")
@@ -443,9 +475,11 @@ class Engine:
         pool = {}
         if self.de.loaded:
             dict_cands = []
+            full_py = ""
             if n >= 2 and n % 2 == 0:
-                py = " ".join(decode_syllable(code[i:i + 2]) for i in range(0, n, 2))
-                dict_cands += self.de.lookup_pinyin(py, self.n_pool)
+                full_py = " ".join(decode_syllable(code[i:i + 2])
+                                   for i in range(0, n, 2))
+                dict_cands += self.de.lookup_pinyin(full_py, self.n_pool)
             if n >= 2:
                 # 简拼召回放宽到 2 键：bz→包子、mb→面包 是最高频场景，
                 # 之前 n>=3 把它们全部挡在召回之外。2 键另需更深召回：
@@ -463,7 +497,13 @@ class Engine:
                     continue
                 pym = self.de.word_py.get(w) or ""
                 m = max(1, len(pym.split()))
-                pool[w] = self.rr.score_word(w, prevs) / m
+                c = self.rr.score_word(w, prevs) / m
+                # 全码整词提权（2026-09-07 主人 jylwviwu「菌类植物」案）：
+                # 用户打满整词音节（4 音码→4 音词）时这个词就是目标本身——
+                # 押过后简拼召回里缩水的 2 音节词，更压过虚词拼装伪句。
+                if n % 2 == 0 and full_py and m == n // 2:
+                    c -= WORD_BOOST / m
+                pool[w] = c
         if n >= 2:
             # 整句切分放开到任意码长：短码也要能预测词库外组合
             vpool = []
@@ -509,17 +549,54 @@ class Engine:
         # 字上百个，不设限会吃满候选池、把底库智能词全部挤出（包子在
         # _cache_pool_scores 里却进不了 base），且 n_mb>池长让 _on_neural
         # 的 n_mb>=len(base) 守卫直接丢弃裁判结果。固频区封顶两页半。
-        mb_part = (mb_hits + mb_prefix)[: 24]
+        # 【2026-09-07 二修，主人报案「前 8 全是四字词」】未完成码（<4 键）的
+        # prefix 是声母前缀大爆炸（bz→56 个四字成语 暴躁不安/不醉不归…），
+        # 它们不是背过的码、没有肌肉记忆价值，只占固频区坑位。未完成码的
+        # 固频区只收短词（<=2 字，真简码词 变/不在/不再 全保留）+ 封顶一页。
+        if n <= 3:
+            mb_part = (mb_hits + [w for w in mb_prefix if len(w) <= 2])[: 9]
+        else:
+            mb_part = (mb_hits + mb_prefix)[: 24]
         n_mb = len(mb_part)
         self._cache_pool_scores = dict(ranked_pool)  # 神经精排的统计基底
         # 全量动态池（不截断）：统计排名靠后的词（bz→包子 在 35 位）也能
         # 送进 LLM 判别名单——词可以先被统计层截断，但判别分高就得回流。
         self._cache_dynall = [w for w, _ in ranked_pool]
-        sents_all = [w for w, _ in ranked_pool if len(w) >= 5]
-        dict_side = [w for w, _ in ranked_pool if len(w) < 5][: self.n_pool - n_mb]
+        # 裁判可评分名单（2026-09-07 piye 案二修 + jylwviwu 案三修）：
+        # viterbi 拼字伪句（普查员嗯/教育了我正成为是，word_py 查无此串或
+        # 无语料证据）是拼装垃圾，Qwen 0.5B 会给它们打分出虚幻的「通顺」高分
+        # 霸占前排。名单=词库真词 + 证据分达标的整句（_eval_sent>=EV_SENT_GOOD），
+        # 伪句/证据不足句一律不裁——裁判的核心价值在整句判别，短码靠统计层。
+        real = lambda w: (w in self.de.word_py) or (
+            len(w) >= 5 and not any(ch in COIN_BLOCK for ch in w)
+            and self.rr._eval_sent(w) >= EV_SENT_GOOD)
+        self._cache_dynscore = [w for w, _ in ranked_pool if real(w)]
+        py_len = lambda w: len((self.de.word_py.get(w) or "").split())
+        # 候选三档（2026-09-07 主人定案：伪句一个都不能有）：
+        #   一档 短真词：1~2 音节且有拼音（变/包子/皮也）。viterbi 拼出的
+        #        非词串（普查员嗯 这类 word_py 查无拼音）不算词，不进候选。
+        #   二档 长真词：3~4 音节且 weight 过闸的真词（菌类植物）。低权长词
+        #        （菌类职务/菌类织物/菌类之屋 这类自然二连字组合）不占坑位。
+        #        py_len 限定 >=3：**杜绝与一档重复**（piye 案——僻野/屁也
+        #        1~2 音节词曾同时进 short_words 与 heavy，屏上 6~9 位与 1~5
+        #        位原样重复）。
+        #   三档 真句：证据分达标的整句（词典整词=1.0，或口语 3gram 命中率高）。
+        #        弱句（0<ev<EV_SENT_GOOD）与无拼音伪句（ev=0）**彻底不进候选**，
+        #        不再翻页可见——打长码时屏上只有词和真话，不掺一句假。
+        short_words = [w for w, _ in ranked_pool
+                       if len(w) < 5 and 1 <= py_len(w) <= 2]
+        long_words = [w for w, _ in ranked_pool
+                      if len(w) < 5 and py_len(w) >= 3]
+        heavy = [w for w in long_words
+                 if self.de.weight(w) >= LONGWORD_MIN_A]
+        cap_dyn = 48 if n == 2 else (self.n_pool - n_mb)
+        dict_side = (short_words + heavy)[: max(cap_dyn, 16)]
         base = mb_part + dict_side
         seen_base = set(base)
-        base += [w for w in sents_all if w not in seen_base]
+        ev = lambda w: self.rr._eval_sent(w)
+        sents_good = [w for w, _ in ranked_pool
+                      if len(w) >= 5 and ev(w) >= EV_SENT_GOOD]
+        base += [w for w in sents_good if w not in seen_base]
         # AI 顺延：静态侧命中 k 个，AI 从第 k+1 位起
         merged = base[:]
         for w in self.ai.peek(self.context_key(), code):
@@ -592,7 +669,18 @@ class Engine:
             return user32.CallNextHookEx(None, ncode, wparam, lparam)
         if msg not in (WM_KEYDOWN, WM_SYSKEYDOWN):
             return user32.CallNextHookEx(None, ncode, wparam, lparam)
-        if ctrl or alt or key_down(VK_LWIN) or key_down(VK_RWIN):
+        # `~ 键完全透传：不参与组码/清码/上屏任何处理（2026-09-07 报案：
+        # 按 ~ 候选窗消失=旧逻辑把它当组码标点触发 hide）。想输出 ~ 就输出。
+        if vk == 0xC0:
+            return user32.CallNextHookEx(None, ncode, wparam, lparam)
+        # 组合键/系统键组合一律放行：Alt+字母 以 WM_SYSKEYDOWN 上报（PowerToys
+        # 的 alt+wasd→方向键全靠这类事件，输入法不得截胡）。GetAsyncKeyState
+        # 异步状态在钩子回调里偶发漏检（alt+a 打出 aaaa 案），事件本身的
+        # 系统语义更可靠。CapsLock 大写锁定时整体放行：目标应用自管大小写，
+        # 输入法不拦截不转码（中文输入法惯例）。
+        if msg == WM_SYSKEYDOWN or ctrl or alt \
+                or key_down(VK_LWIN) or key_down(VK_RWIN) \
+                or bool(user32.GetKeyState(VK_CAPITAL) & 0x01):
             if self.buffer:
                 self.buffer = ""
                 self.q.put(("hide",))
@@ -799,11 +887,39 @@ class Engine:
             sents_ranked = [w for w in tail
                             if w in self._cache_pool_scores and len(w) >= 5]
         cap = max(0, self.n_pool - n_mb - len(sents_ranked))
-        merged = base[:n_mb] + sents_ranked + [w for w, _ in words[:cap]] + rest
+        # 词先句后（2026-09-07 主人「菌类植物」案）：整句绝不无条件压词。
+        # 打全码（jylwviwu）时目标词 菌类植物 是被 WORD_BOOST 抬到动态区
+        # 最前的——若裁判回流把整句组提到词前，全码真词反而被挤后。
+        # 用户要的是「词和句都按常用度排」：词比句常用，词在前、真句在后。
+        merged = base[:n_mb] + [w for w, _ in words[:cap]] + sents_ranked + rest
         self._cache_cands = merged
         self.q.put(("show", self.buffer, merged, n_mb, self._last_pos))
         self.log("[%s] %s 精排整句%d 词%d %dms" % (
             "裁判" if judge else "RBT3", code, len(sents), len(words), ms))
+
+    def _on_cloud_generate(self, code, items, ms):
+        """云端生成首选到达（豆包式）：直接写答案，不依赖候选池。
+
+        与判别式精排的分水岭：判别只能在池里挑（池里没有的永远出不来），
+        生成把「用户最可能想打的」写进候选窗。落位规则：
+        - 码表固频区（n_mb 个，用户背熟的音形码）永远压顶，不被动；
+        - 生成结果插在固频区之后、动态区之前——简拼/未全码时就是首选；
+        - 已在动态区里的同名候选去重（避免候选窗重复）。
+        buffer 已变（用户继续击键/已上屏）则丢弃本包结果。
+        """
+        if self.buffer != code or not items:
+            return
+        base = self._cache_cands
+        n_mb = self._cache_nmb
+        if not base or n_mb >= len(base):
+            return
+        # 全码/固频区占满时不插（用户打满码是确定性输入，码表说了算）
+        head = base[:n_mb]
+        rest = [w for w in base[n_mb:] if w not in items]
+        merged = head + list(items) + rest
+        self._cache_cands = merged
+        self.q.put(("show", self.buffer, merged, n_mb, self._last_pos))
+        self.log("[云端生成] %s → %s %dms" % (code, " / ".join(items), ms))
 
     def _eat(self):
         self.stats["eaten"] += 1
@@ -830,9 +946,15 @@ class Engine:
             self._judge_ctx = (self.ctx_tail_text or "").strip()
             # 评分名单用全量动态池：词可以先被统计截断（bz→包子 35 位被
             # dict_side 截断线挡掉），但不能被挡在裁判门外——判别分高的
-            # 词由 _on_neural 回流进动态区前部。
-            dyn_all = getattr(self, "_cache_dynall", None) or cands[n_mb:]
-            if self.judge.ready:
+            # 词由 _on_neural 回流进动态区前部。名单本身剔除语气词粘合
+            # 伪句（_cache_dynscore），裁判不为垃圾背书。
+            dyn_all = getattr(self, "_cache_dynscore", None) \
+                or getattr(self, "_cache_dynall", None) or cands[n_mb:]
+            if self.cloud_judge.ready:
+                # 云端接管：只发生成首选请求（豆包式，_on_cloud_generate
+                # 压顶动态区）；动态区顺序由 RBT3 兜底，不再双重精排。
+                self.cloud_judge.request_generate(self.buffer, self.ctx_tail_text)
+            elif self.judge.ready:
                 self.judge.request(self.buffer, self.ctx_tail_text, dyn_all)
             elif self.nr.ready:
                 self.nr.request(self.buffer, self.ctx_tail_text, dyn_all)
@@ -889,14 +1011,8 @@ class Engine:
             self.de.remember(word, py)  # 新词入库/旧词调频，批量落盘
         send_unicode(word)  # 注入事件自带 INJECTED 标志，会被钩子放行
         self._streak_push(word, coin_py)  # 连续片段链：自动造词原料
-        # 上屏联想（豆包式）：提示后面可能的词，空格上屏首选，数字键选其余
-        self.liaison = None
-        if self.cfg.get("liaison", True):
-            n = int(self.cfg.get("liaison_count", 6))
-            nxt = self.rr.next_word(word, n)
-            if nxt:
-                self.liaison = nxt
-                self.q.put(("liaison", word, self.liaison, caret_pos()))
+        # 上屏联想已按主人 2026-09-07 指示移除：上屏后不提示任何后续词，
+        # 联想的空格/数字消费分支恒不触发（self.liaison 保持 None）。
 
     # ---- 自动造词：连续上屏片段链 ----
     # 原理：词库里没有的组合，用户用辅码逐字打出来（张|布|斯、试|作|古|华），
