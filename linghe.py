@@ -390,6 +390,7 @@ class Engine:
         self._cache_nmb = 0
         self._cache_ctx = ""         # 缓存对应的上文（同码不同上文须重算）
         self._cache_dyn = None       # 缓存对应的动态调频状态（开/关结果不同）
+        self._cache_smart0 = False   # 四码契约：首选位被智能词占据（选中仍调频）
         self.liaison = None          # 上屏联想词列表（豆包式：上屏后提示后续词）
         self.ctx_prevs = []          # 光标处上文词列表（tail_words 切出，最近在前；
                                      # 豆包「指哪打哪」：多上文衰减打分的输入）
@@ -654,6 +655,7 @@ class Engine:
             self._cache_dyn = self.dyn_mode
             self._cache_cands = [tag]
             self._cache_nmb = 1
+            self._cache_smart0 = False
             return [tag], 1
         n = len(code)
         fused = self._fused_candidates(code)
@@ -892,6 +894,38 @@ class Engine:
                       if len(w) >= 5 and (ev(w) >= EV_SENT_GOOD
                                           or self.rr._clean_chain(w))]
         base += [w for w in sents_good if w not in seen_base]
+        # 【2026-09-07 主人定案·四码排序契约】四码候选形态：
+        #   [智能首选词] + [码表四码单字（固频序）] + [码表其余] + [动态其余]…
+        # 主人原话：几码都应该智能调频，仅前两码跟在固定词库后面；三码跟在
+        # 固定词库三码单字后面（现状已满足：mb_part 前置）；第四码智能首选
+        # 词去第一位——码表该码首选是①占位或词语时直接替换它；码表单字
+        # 永远固定在次选、三选、四选…（肌肉记忆位置不漂移，想打单字翻位
+        # 可盲选）。动态池空时码表原序全权接管。①不是汉字，单字判定走
+        # _is_hanzi。_cache_smart0 标记首选被智能词占据：选中首选仍走
+        # 智能调频（remember），不受 from_mabiao 豁免。
+        self._cache_smart0 = False
+        if n == 4:
+            singles4 = [w for w in mb_exact
+                        if len(w) == 1 and self._is_hanzi(w)]
+            # 智能首选词 = 动态池里打满音节数（4键=2音节）的真词之首：
+            # 单字虚词（的一是）py_len=1 不配顶四码首选——用户打满 2 音节
+            # 意图就是 2 音节词（与 WORD_BOOST / 云端压顶的整词音节约定一致）
+            smarts = [w for w in dict_side
+                      if len((self.de.word_py.get(w) or "").split()) == n // 2]
+            smart = smarts[0] if smarts else ""
+            # 主人契约：单字**始终**固定在四码的次选起（多个单字依次三选、
+            # 四选…）；码表①占位/词组本是占位，退到单字之后（yiyi 案：
+            # exact=意义/刈/异议 —— 意义占位词不许把单字 刈 顶离次选）；
+            # 有智能首选词时再顶到第 1 位（①/词语被替换）。动态池空且
+            # 无单字时码表原序不动。
+            if smart or singles4:
+                head = ([smart] if smart else []) + singles4
+                rest = [w for w in base if w not in head]
+                base = (head + rest)[: self.n_pool]
+                if smart:
+                    self._cache_smart0 = True
+                    if mb_part:
+                        n_mb += 1   # 码表固频区整体被插队后移一位
         # 【2026-09-07 端侧动态调频压顶】dyn_mode 四码起（odt 空格开）：
         # 云端已关，压顶由万象语法接棒——「上下文证据最强」的候选提到码表
         # 固频之前做首选（这是一部+uiui → 史诗，gram 10.3/ev22 压过码表
@@ -1324,7 +1358,17 @@ class Engine:
         # 首选全是冷门词、真词不在第一页）；云端有语义+常识+上文，压顶可信。
         # 本地 0.1s 先出稳定序，云端 ~1.4s 到后升级首选。
         if self.dyn_mode and len(code) >= DYN_MIN_LEN:
-            merged = list(items) + [w for w in base if w not in items]
+            # 【2026-09-07 四码契约】云端词也是智能词，去首选；但码表四码
+            # 单字固定次选起（肌肉记忆位置不漂移），不能被云端词整段压走。
+            if len(code) == 4 and self.mb.loaded:
+                singles4 = [w for w in self.mb.exact(code)
+                            if len(w) == 1 and self._is_hanzi(w)
+                            and w not in items]
+                merged = (list(items) + singles4
+                          + [w for w in base
+                             if w not in items and w not in singles4])
+            else:
+                merged = list(items) + [w for w in base if w not in items]
             merged = merged[: self.n_pool]
             self._cache_cands = merged
             self._cache_nmb = 0   # 云端词视为动态区：选中走调频，不入固频
@@ -1364,8 +1408,13 @@ class Engine:
         self._last_pos = pos
         if cands:
             self.q.put(("show", self.buffer, cands, n_mb, pos))
+        elif self.ai.ready or self.cloud_judge.ready:
+            self.q.put(("think", self.buffer, pos))  # 静态零命中，智能层在途
         else:
-            self.q.put(("think", self.buffer, pos))  # 静态零命中，AI 在途
+            # 【2026-09-07 主人报案「一直三个点」】AI 与云端裁判都没在途时，
+            # 「…」永远不会有人来替换——挂着省略号让主人白等。直接收窗，
+            # 打不出就是打不出，不装思考。
+            self.q.put(("hide",))
         # 精排直送裁判（2026-09-07 主人判死速度：「不可能等一个候选六秒」）：
         # 裁判上 GPU fp16 后全池 66 句一遍 ~0.3s——两级粗筛（RBT3 每键 2s）
         # 在稳态整体退役，裁判直接全量终审，整句零截断零粗筛。裁判未就绪
@@ -1415,6 +1464,10 @@ class Engine:
         # 背过的码，不受 from_mabiao 豁免约束。
         py = self._composed_py.get(word)
         from_mabiao = sel_idx is not None and sel_idx < n_mb
+        # 【2026-09-07 四码契约】首选位被智能词占据（_cache_smart0）时，
+        # 选中首选=选智能词，照常 remember 调频——这就是四码智能调频本身
+        if getattr(self, "_cache_smart0", False) and sel_idx == 0:
+            from_mabiao = False
         if py:
             from_mabiao = False   # 组词不是背过的码，选中=最强造词证据
         elif self.de.loaded and not from_mabiao and len(self.buffer) >= 2 \
