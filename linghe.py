@@ -269,6 +269,8 @@ class Engine:
         self.ctx_tail_text = ""      # 光标前原始文本尾部（神经重排的 MLM 输入）
         self._last_pos = (300, 300)  # 最近候选窗位置（异步刷新时复用）
         self._cache_pool_scores = {}  # 同池统计分缓存（神经精排的融合基底）
+        self._cache_dynall = None     # 全量动态池（送裁判评分名单用，不截断）
+        self._judge_ctx = ""          # 送裁时刻的上文（决定裁判 λ 是否放大）
         self._streak = []            # 连续上屏片段链（自动造词原料）：
                                      # 张|布|斯 →「张布斯」；试作|古|华 →「试作古华」
         self._streak_seen = {}       # 拼接串→连续出现次数（重复造词模式）
@@ -510,6 +512,9 @@ class Engine:
         mb_part = (mb_hits + mb_prefix)[: 24]
         n_mb = len(mb_part)
         self._cache_pool_scores = dict(ranked_pool)  # 神经精排的统计基底
+        # 全量动态池（不截断）：统计排名靠后的词（bz→包子 在 35 位）也能
+        # 送进 LLM 判别名单——词可以先被统计层截断，但判别分高就得回流。
+        self._cache_dynall = [w for w, _ in ranked_pool]
         sents_all = [w for w, _ in ranked_pool if len(w) >= 5]
         dict_side = [w for w, _ in ranked_pool if len(w) < 5][: self.n_pool - n_mb]
         base = mb_part + dict_side
@@ -753,6 +758,10 @@ class Engine:
 
         只重排池内已有的候选（MLM 打分是判别式的：不生成、只裁决）。
         buffer 已变（用户继续击键/已上屏）则丢弃本包结果。
+
+        回流（2026-09-07 bz→包子 案）：评分名单已扩至全量动态池，base 外
+        的判别高分词组（包子 统计 35 位被截断、LLM 判第 1）按融合分与池内
+        词组同场排序，自然回流进动态区前部——「统计层管召回，裁判管裁决」。
         """
         if self.buffer != code or not scores:
             return
@@ -760,28 +769,37 @@ class Engine:
         n_mb = self._cache_nmb
         if not base or n_mb >= len(base):
             return
+        # 有明确上文时裁判主导（λ 放大）：判别式整句 logP 在「我吃了一个+bz」
+        # 下对 包子 是决定性的（-6.09 vs 不再 -7.58，λ>1.05 才翻盘，1.5 留
+        # 余量）。无上文时 2 字词判别不可靠（诗仙案：来吧 -4.94 压过 李白），
+        # λ 维持原值不动，避免乱序回归。
+        lam = 1.5 if (judge and self._judge_ctx and len(self._judge_ctx) >= 2) \
+            else self.neural_lambda
         tail = base[n_mb:]
-        # 整句与词分两组：整句组按**纯裁判分**排序置顶。为什么不用融合式：
-        # 统计代价里口语串结构性输给书面长词链 2 nat+，λ=1 的神经增益
-        # (~1.2) 追不回——整句候选的价值由伪似然独立裁决（豆包式：长码
-        # 用户要的就是整句，置顶展示）。词组维持统计+神经融合。
-        # ⚠️ 整句组只认 LLM 裁判：RBT3 的新闻语料偏差实测把「文件…」类
-        # 书面串顶上 top1（主人 run.bat 案 2026-09-06，B 组探针复现）——
-        # 裁判未就绪的加载窗口里整句保持统计序（宁缺毋滥），词组照常融合。
+        tail_set = set(tail)
         sents = [(scores[w], w) for w in tail
                  if w in scores and w in self._cache_pool_scores and len(w) >= 5]
-        words = [(self._cache_pool_scores[w] - self.neural_lambda * scores[w], w)
-                 for w in tail
-                 if w in scores and w in self._cache_pool_scores and len(w) < 5]
-        rest = [w for w in tail if w not in scores or w not in self._cache_pool_scores]
+        # 词组融合 + 回流：池内词组与评分名单里 base 外的词组（须有统计基底
+        # 分可比）统一按融合分排序。被挤出槽位的池内原词仍保留（不消失）。
+        fused = {}
+        for w in tail:
+            if len(w) < 5 and w in scores and w in self._cache_pool_scores:
+                fused[w] = self._cache_pool_scores[w] - lam * scores[w]
+        for w, s in scores.items():
+            if len(w) >= 5 or w in tail_set or w not in self._cache_pool_scores:
+                continue
+            fused[w] = self._cache_pool_scores[w] - lam * s
+        words = sorted(fused.items(), key=lambda kv: kv[1])
+        cand_set = {w for _, w in words}
+        rest = [w for w in tail if w not in cand_set]
         if judge:
             sents.sort(reverse=True)   # logP 越大（越接近 0）越通顺
             sents_ranked = [w for _, w in sents]
         else:
             sents_ranked = [w for w in tail
                             if w in self._cache_pool_scores and len(w) >= 5]
-        words.sort()
-        merged = base[:n_mb] + sents_ranked + [w for _, w in words] + rest
+        cap = max(0, self.n_pool - n_mb - len(sents_ranked))
+        merged = base[:n_mb] + sents_ranked + [w for w, _ in words[:cap]] + rest
         self._cache_cands = merged
         self.q.put(("show", self.buffer, merged, n_mb, self._last_pos))
         self.log("[%s] %s 精排整句%d 词%d %dms" % (
@@ -809,10 +827,15 @@ class Engine:
         # （启动加载窗口）才回退 RBT3 词组融合（整句组保持统计序，见
         # _on_neural 门禁）。异步不阻塞击键，worker 只留最新请求。
         if len(self.buffer) >= 2 and len(cands) > n_mb:
+            self._judge_ctx = (self.ctx_tail_text or "").strip()
+            # 评分名单用全量动态池：词可以先被统计截断（bz→包子 35 位被
+            # dict_side 截断线挡掉），但不能被挡在裁判门外——判别分高的
+            # 词由 _on_neural 回流进动态区前部。
+            dyn_all = getattr(self, "_cache_dynall", None) or cands[n_mb:]
             if self.judge.ready:
-                self.judge.request(self.buffer, self.ctx_tail_text, cands[n_mb:])
+                self.judge.request(self.buffer, self.ctx_tail_text, dyn_all)
             elif self.nr.ready:
-                self.nr.request(self.buffer, self.ctx_tail_text, cands[n_mb:])
+                self.nr.request(self.buffer, self.ctx_tail_text, dyn_all)
         # AI 只在长码（第 5 码起）时补位：短码静态侧（码表+底库+重排）已足够强，
         # 生成式 LLM 也物理上进不了打字节奏（200ms/字 vs 300ms+ 热调用）。
         # 整句场景有天然停顿（打完一串键才看结果），AI 300ms 能赶上。

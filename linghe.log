@@ -448,3 +448,55 @@ AttributeError: 'Engine' object has no attribute 'buffer'
 [冒烟] AI: 未就绪 ready= False
 [冒烟] 样例查询 aih -> ['爱']
 [冒烟] 样例查询 aq  -> ['爱情', '安全']
+[码表] 197158 个词条，126576 个码位，加载 2556ms
+[辅码] 9980 行（首键筛选），字数 8400
+[共现] 载入 218 条用户二元关系
+[底库] 轻量索引 200000 词就绪（8868ms，全量后台继续加载）
+[底库] 200001 个词条（全拼/简拼双索引），缓存加载 1994ms
+[底库] 后台加载完成：200001 词条
+[共现] 预训练表 词1990845 字199238（SIGHAN 语料）
+[共现] 口语词频 283486 词
+[AI] 已按配置停用（ai.enabled=false），纯静态模式
+========================================================
+ 灵鹤 LingHe  外挂式 AI 输入法（小鹤音形向）
+  开关热键: Ctrl+Alt+L    退出: 控制台 Ctrl+C
+  空格=首选  ;=2选  '=3选  数字1-9=选字  Esc=清码
+  =/Tab=下一页  -=上一页  回车=上屏英文  Shift单击=上屏英文/切中英
+========================================================
+[码表] 197158 个词条，126576 个码位，加载 2556ms
+[辅码] 9980 行（首键筛选），字数 8400
+[共现] 载入 218 条用户二元关系
+[底库] 轻量索引 200000 词就绪（8868ms，全量后台继续加载）
+[底库] 200001 个词条（全拼/简拼双索引），缓存加载 1994ms
+[底库] 后台加载完成：200001 词条
+[共现] 预训练表 词1990845 字199238（SIGHAN 语料）
+[共现] 口语词频 283486 词
+[AI] 已按配置停用（ai.enabled=false），纯静态模式
+[神经] RBT3 就绪 provider=DmlExecutionProvider 加载1505ms
+[造词] 二我 (er wo)
+[RBT3] bz 精排整句0 词66 1583ms
+[RBT3] bz 精排整句0 词66 1727ms
+[RBT3] wilygbz 精排整句59 词0 5886ms
+[RBT3] wilygbz 精排整句59 词0 5515ms
+[底库] 2731824 个词条（全拼/简拼双索引），缓存加载 93887ms
+[底库] 后台加载完成：2731824 词条
+[RBT3] wilygbz 精排整句59 词0 1540ms
+[RBT3] ydgxl 精排整句55 词0 1306ms
+[LLM裁判] Qwen2.5-0.5B 就绪 加载75510ms
+E:\miniconda3\Lib\site-packages\transformers\models\qwen2\modeling_qwen2.py:544: UserWarning: 1Torch was not compiled with flash attention. (Triggered internally at ..\aten\src\ATen\native\transformers\cuda\sdp_utils.cpp:263.)
+  attn_output = torch.nn.functional.scaled_dot_product_attention(
+[裁判] ydgxl 精排整句55 词0 1127ms
+[裁判] ilyg 精排整句8 词11 263ms
+[裁判] bz 精排整句0 词66 662ms
+[裁判] ilyg 精排整句8 词12 110ms
+[裁判] ily 精排整句0 词67 0ms
+[裁判] il 精排整句0 词66 0ms
+[裁判] bz 精排整句0 词66 127ms
+[裁判] yir 精排整句0 词42 406ms
+[模式] 英文
+[模式] 中文
+[裁判] td 精排整句0 词66 0ms
+[裁判] tdd 精排整句0 词66 679ms
+[裁判] td 精排整句0 词66 0ms
+[裁判] tdd 精排整句0 词66 0ms
+[模式] 英文
