@@ -1,9 +1,12 @@
 @echo off
 rem LingHe launcher - double click.
-rem 2026-09-05: LLM(qwen/Ollama) 兜底退役, 神经重排(RBT3 ONNX)接棒——不再启动 Ollama。
-rem 2026-09-07: 常驻控制台带标题「灵鹤 LingHe」，实时滚日志；关窗口=退出输入法。
+rem ASCII-only on purpose: cmd.exe parses .bat in ANSI(GBK) codepage,
+rem UTF-8 Chinese comments corrupt the parser (2026-09-08 crash case).
+rem 2026-09-08: cmd /k keeps the window open on crash (no more flash-exit).
+rem             -X faulthandler prints native crashes too.
+rem             Switch back to plain start once stable.
 setlocal
 set "LINGHE_DIR=%~dp0"
 
-start "灵鹤 LingHe" "E:\miniconda3\python.exe" "%LINGHE_DIR%linghe.py"
+start "LingHe" cmd /k ""E:\miniconda3\python.exe" -X faulthandler "%LINGHE_DIR%linghe.py""
 endlocal
