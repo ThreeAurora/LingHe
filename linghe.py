@@ -395,6 +395,7 @@ class Engine:
         self.ctx_prevs = []          # 光标处上文词列表（tail_words 切出，最近在前；
                                      # 豆包「指哪打哪」：多上文衰减打分的输入）
         self.ctx_tail_text = ""      # 光标前原始文本尾部（神经重排的 MLM 输入）
+        self._lite = False           # 训练数据生成专用：True 跳过整句召回通道
         self._last_pos = (300, 300)  # 最近候选窗位置（异步刷新时复用）
         self._cache_pool_scores = {}  # 同池统计分缓存（神经精排的融合基底）
         self._cache_dynall = None     # 全量动态池（送裁判评分名单用，不截断）
@@ -716,7 +717,10 @@ class Engine:
                 if n % 2 == 0 and full_py and m == n // 2:
                     c -= WORD_BOOST / m
                 pool[w] = c
-        if n >= 2:
+        # _lite：训练数据生成专用（2026-09-07）。整句通道（viterbi/锚定/
+        # 最大匹配/字链）产出的是伪句串，词级重排样本用不到，却占 compute
+        # 大头耗时——生成器置 eng._lite=True 跳过，打字主链路不受影响。
+        if n >= 2 and not getattr(self, "_lite", False):
             # 整句切分放开到任意码长：短码也要能预测词库外组合
             vpool = []
             if n % 2 == 0 and n >= 4:
