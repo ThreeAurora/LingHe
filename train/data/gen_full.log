@@ -1,0 +1,20 @@
+  [msr_training.utf8] line 0  out=12  stat={'skip_len': 0, 'skip_py': 0, 'missed': 0, 'hit': 12}  0s
+  [msr_training.utf8] line 5000  out=60633  stat={'skip_len': 598, 'skip_py': 9, 'missed': 1735, 'hit': 60633}  131s
+  [msr_training.utf8] line 10000  out=123653  stat={'skip_len': 1511, 'skip_py': 39, 'missed': 3678, 'hit': 123653}  263s
+  [msr_training.utf8] line 15000  out=191963  stat={'skip_len': 2560, 'skip_py': 194, 'missed': 5989, 'hit': 191963}  438s
+  [msr_training.utf8] line 20000  out=263102  stat={'skip_len': 3625, 'skip_py': 470, 'missed': 8391, 'hit': 263102}  653s
+  [msr_training.utf8] line 25000  out=335677  stat={'skip_len': 4489, 'skip_py': 697, 'missed': 10384, 'hit': 335677}  886s
+  [msr_training.utf8] line 30000  out=404125  stat={'skip_len': 5584, 'skip_py': 985, 'missed': 12743, 'hit': 404125}  1091s
+  [msr_training.utf8] line 35000  out=474241  stat={'skip_len': 6183, 'skip_py': 1246, 'missed': 14595, 'hit': 474241}  1294s
+  [msr_training.utf8] line 40000  out=541281  stat={'skip_len': 7055, 'skip_py': 1497, 'missed': 16619, 'hit': 541281}  1488s
+  [msr_training.utf8] line 45000  out=600750  stat={'skip_len': 7789, 'skip_py': 1884, 'missed': 18839, 'hit': 600750}  1676s
+  [msr_training.utf8] line 50000  out=665889  stat={'skip_len': 8779, 'skip_py': 2217, 'missed': 21181, 'hit': 665889}  1869s
+  [msr_training.utf8] line 55000  out=738430  stat={'skip_len': 9924, 'skip_py': 2524, 'missed': 23621, 'hit': 738430}  2099s
+  [msr_training.utf8] line 60000  out=806336  stat={'skip_len': 10886, 'skip_py': 2815, 'missed': 25906, 'hit': 806336}  2317s
+Traceback (most recent call last):
+  File "E:\CCSpace\projects\2026\09\linghe\train\gen_data.py", line 173, in <module>
+    g.run(["cache/tmp/corpus/msr_training.utf8",
+  File "E:\CCSpace\projects\2026\09\linghe\train\gen_data.py", line 137, in run
+    for li, line in enumerate(f):
+  File "<frozen codecs>", line 322, in decode
+UnicodeDecodeError: 'utf-8' codec can't decode bytes in position 0-1: unexpected end of data

@@ -1,0 +1,3 @@
+  [msr_training.utf8] line 0  out=12  stat={'skip_len': 0, 'skip_py': 0, 'missed': 0, 'hit': 12}  1s
+  [pku_training.utf8] line 0  out=2544  stat={'skip_len': 1, 'skip_py': 0, 'missed': 56, 'hit': 2544}  229s
+DONE 9869 samples, stat={'skip_len': 46, 'skip_py': 21, 'missed': 231, 'hit': 9869}, 1385s

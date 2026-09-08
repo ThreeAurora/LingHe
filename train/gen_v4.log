@@ -1,0 +1,18 @@
+  [msr_training.utf8] line 0  out=30  stat={'skip_len': 0, 'skip_py': 0, 'missed': 0, 'hit': 12}  0s
+  [msr_training.utf8] line 5000  out=157505  stat={'skip_len': 598, 'skip_py': 9, 'missed': 1735, 'hit': 60633}  63s
+  [msr_training.utf8] line 10000  out=323768  stat={'skip_len': 1511, 'skip_py': 39, 'missed': 3678, 'hit': 123653}  132s
+  [msr_training.utf8] line 15000  out=506672  stat={'skip_len': 2560, 'skip_py': 56, 'missed': 5939, 'hit': 192015}  202s
+  [msr_training.utf8] line 20000  out=696341  stat={'skip_len': 3625, 'skip_py': 278, 'missed': 8304, 'hit': 263130}  300s
+  [msr_training.utf8] line 25000  out=890861  stat={'skip_len': 4489, 'skip_py': 505, 'missed': 10302, 'hit': 335706}  402s
+  [msr_training.utf8] line 30000  out=1072124  stat={'skip_len': 5584, 'skip_py': 793, 'missed': 12669, 'hit': 404149}  521s
+  [msr_training.utf8] line 35000  out=1257783  stat={'skip_len': 6183, 'skip_py': 1054, 'missed': 14522, 'hit': 474264}  623s
+  [msr_training.utf8] line 40000  out=1436127  stat={'skip_len': 7055, 'skip_py': 1305, 'missed': 16547, 'hit': 541303}  713s
+  [msr_training.utf8] line 45000  out=1588133  stat={'skip_len': 7789, 'skip_py': 1692, 'missed': 18734, 'hit': 600782}  797s
+  [msr_training.utf8] line 50000  out=1759392  stat={'skip_len': 8779, 'skip_py': 2025, 'missed': 21082, 'hit': 665973}  893s
+  [msr_training.utf8] line 55000  out=1953597  stat={'skip_len': 9924, 'skip_py': 2332, 'missed': 23547, 'hit': 738495}  999s
+  [msr_training.utf8] line 60000  out=2132484  stat={'skip_len': 10886, 'skip_py': 2623, 'missed': 25827, 'hit': 806360}  1099s
+  [pku_training.utf8] line 0  out=2262887  stat={'skip_len': 11543, 'skip_py': 2876, 'missed': 27550, 'hit': 856101}  1177s
+  [pku_training.utf8] line 5000  out=2659231  stat={'skip_len': 12089, 'skip_py': 3602, 'missed': 31083, 'hit': 1006860}  1394s
+  [pku_training.utf8] line 10000  out=3057632  stat={'skip_len': 12649, 'skip_py': 4329, 'missed': 34495, 'hit': 1158446}  1602s
+  [pku_training.utf8] line 15000  out=3431783  stat={'skip_len': 13151, 'skip_py': 5254, 'missed': 38143, 'hit': 1301804}  1830s
+DONE 3719947 samples, stat={'skip_len': 13543, 'skip_py': 5868, 'missed': 40878, 'hit': 1412400}, 2011s

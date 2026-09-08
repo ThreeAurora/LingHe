@@ -1,0 +1,1 @@
+eval done val=74398 base_P@1=0.4638 rerank_P@1=0.8658 best_tau=0.00 -> 0.8658  50s

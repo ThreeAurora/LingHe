@@ -1,0 +1,14 @@
+rows=3707402
+E:\CCSpace\projects\2026\09\linghe\train\preconvert.py:53: DeprecationWarning: NumPy will stop allowing conversion of out-of-bound Python integers to integer arrays.  The conversion of 148 to int8 will fail in the future.
+For the old behavior, usually:
+    np.array(value).astype(dtype)
+will give the desired result (the cast overflows).
+  wlen[i, j] = len(w)
+  500000 / 3707402
+  1000000 / 3707402
+  1500000 / 3707402
+  2000000 / 3707402
+  2500000 / 3707402
+  3000000 / 3707402
+  3500000 / 3707402
+DONE 3707402 rows -> E:\CCSpace\projects\2026\09\linghe\train\data\mm

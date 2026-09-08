@@ -1,0 +1,9 @@
+[dl] OpenSubtitles_zh <- v2024
+  [retry] v2024: HTTP Error 404: Not Found
+[dl] OpenSubtitles_zh <- v2018
+  [retry] v2018: HTTP Error 404: Not Found
+[fail] OpenSubtitles_zh: 全部候选失败
+[dl] TED2020_zh <- v1
+[dl] TED2020_zh done 1MB
+[clean] TED2020_zh.txt.gz: 16211 行 -> 12497 行 -> E:\CCSpace\projects\2026\09\linghe\cache\tmp\corpus\colloquial_raw.txt
+DONE
