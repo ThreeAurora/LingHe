@@ -21,13 +21,15 @@ _YUN_FIRST = {}  # 兜底：简拼需要韵母信息时不用，此处仅声母
 
 _SM_CACHE = {}
 
-# 首字母容错：简拼键 s/c/z 同时命中平舌（本键）与翘舌（双拼正键 u/i/v）组。
-# 索引键是 _sm_key 口径（sh 词挂在 u 下），所以 s→u 而非 s→sh。
-_SM_EXPAND = {"s": ("s", "u"), "c": ("c", "i"), "z": ("z", "v")}
+# 平翘容错已于 2026-09-08 应主人明令彻底删除：简拼键只命中本组，
+# 不再展开 s→{s,u} / c→{c,i} / z→{z,v}（旧容错把简拼池翻倍污染，
+# sj 混进 uj 词致金标被压深）。代价：主人混用平翘舌时（传=c/睡=s/上=s）
+# 召不回目标词，须打规范键。保留 _ini_variants 框架仅为最小改动。
+_SM_EXPAND = {}
 
 
 def _ini_variants(keys):
-    """键串的首字母容错变体（32 个封顶，防长码组合爆炸）。"""
+    """键串的简拼变体。2026-09-08 起恒返回原键一种（容错已删）。"""
     variants = [()]
     for k in keys:
         opts = _SM_EXPAND.get(k, (k,))
@@ -480,7 +482,7 @@ class DictEngine:
         return out
 
     def lookup_initial(self, key_str: str, n: int = 9):
-        """简拼声母键串查询（空格分隔双拼声母键，双拼简容错口径）。"""
+        """简拼声母键串查询（空格分隔双拼声母键，规范口径无容错）。"""
         keys = key_str.split()
         with self._lock:
             merged = []
@@ -500,12 +502,11 @@ class DictEngine:
         return out
 
     def initial_span(self, keys, limit=48):
-        """跨度查询（双拼简容错）：返回权重降序去重的词元组。
+        """跨度查询（规范口径）：返回权重降序去重的词元组。
 
-        2026-09-06 主人样本钉死的口径现实：同一批键码里 试=sh→u
-        （nwgngdxcuyx）与 睡/上/传=sh/s 混用——简拼用户的翘舌归属本就
-        不稳定。u/i/v 是双拼正键只命中本组；s/c/z 按首字母口径同时命中
-        平舌（本键）与翘舌（双拼正键 u/i/v）两组。变体 ≤32 封顶。
+        2026-09-08 主人明令删除平翘容错：简拼键只命中本组（s 不再
+        命中 u/sh 组），池子不再被翻倍污染。旧口径记录：09-06 曾因
+        主人混用（试=sh→u、睡/上/传=sh/s 混打）设 s/c/z 双组展开。
         """
         merged = []
         for v in _ini_variants(keys):
