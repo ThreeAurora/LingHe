@@ -38,9 +38,9 @@ ZERO2 = {
 # 规则依据：变体的选择由声母唯一决定（如 shuang 合法而 shiang 不存在）。
 VARIANT = {
     "l": ({"sh", "zh", "ch", "h", "g", "k"}, "uang", "iang"),  # shuang/zhuang/guang… vs liang/xiang…
-    "k": ({"k", "g", "h"}, "uai", "ing"),          # kuai/guai/huai   vs bing/xing…
+    "k": ({"k", "g", "h", "zh", "ch", "sh"}, "uai", "ing"),    # kuai/guai/huai/chuai/shuai/zhuai vs bing/xing…
     "s": ({"j", "x", "q", "y"}, "iong", "ong"),    # jiong/xiong/yong vs song/dong…
-    "x": ({"j", "q", "x"}, "ia", "ua"),            # jia/qia/xia      vs gua/hua/shua
+    "x": ({"j", "q", "x", "l", "d"}, "ia", "ua"),  # jia/qia/xia/lia(俩)/dia(嗲) vs gua/hua/shua
     "o": ({"b", "p", "m", "f", "y", "w"}, "o", "uo"),  # bo/mo/wo     vs duo/tuo/guo
     "v": ({"l", "n"}, "v", "ui"),                  # lv/nv = lü/nü    vs dui/gui…
 }
@@ -61,8 +61,10 @@ def decode_syllable(two: str) -> str:
     if y is None:
         return two
     var = VARIANT.get(c2)
-    if var and sm in var[0]:
-        y = var[1]
+    if var:
+        # 变体键：触发声母用变体韵，其余一律用默认韵（此前默认韵不生效，
+        # hua→hx 曾解成 "hia"；2026-09-07 修复）
+        y = var[1] if sm in var[0] else var[2]
     return sm + y
 
 
