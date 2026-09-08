@@ -522,7 +522,10 @@ class StatReranker:
         keys = tuple(keys[:MAX_KEYS])
         if not keys:
             return []
-        ck = (keys, mode, n, self._cache_ver, prev)
+        # ret_cost 必须进缓存键：否则 ret_cost=True 的 (句子,代价,音节) 元组
+        # 会被后续不带 ret_cost 的同键调用命中，tuple 污染词链 join 崩溃
+        # （2026-09-07 训练数据管线大规模跑码型时炸出）
+        ck = (keys, mode, n, self._cache_ver, prev, ret_cost)
         hit = self._viterbi_cache.get(ck)
         if hit is not None:
             return hit
