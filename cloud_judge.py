@@ -74,6 +74,10 @@ GEN_SYSTEM = (
     "   零声母两键：aa=a oo=o ee=e er=er ai=ai ei=ei ou=ou ao=ao an=an en=en。\n"
     "判定：奇数键=简拼（按声母逐字读）；偶数键=双拼整音节，同时可作简拼词解读"
     "（如 wm=我们/外贸 是简拼；纯双拼例：wj=w+an=晚/万、pb=p+in=拼、ul=sh+uang=双）。\n"
+    "【2026-09-08 简拼优先案】长键串（≥6键）优先按简拼解读（每键一声母）；"
+    "只有当简拼读不成合理中文、而双拼能解出通顺句子时才用双拼。"
+    "例：wnjjglzm = w我 n能 j举 j几 g个 l例 z子 m吗 = 我能举几个例子吗（简拼），"
+    "不要按双拼硬解。\n"
     "硬性要求：输出的每个字，其读音必须与编码严格对应——简拼时每键是该字声母"
     "（ch→i 键、zh→v 键、sh→u 键），双拼时每 2 键解码后正好是该字拼音。"
     "任何一个字对不上编码就整条作废。宁缺毋滥：解不出就输出空数组 []。\n"
@@ -237,6 +241,9 @@ class CloudJudge:
                 # chunk 间隔 250ms/行，非流式 25s 都等不完。关掉后 1382ms 秒回
                 # （2026-09-07 探针钉死：no-thinking 非流式 1382ms 完整出答案）。
                 "thinking": {"type": "disabled"},
+                # 2026-09-08 DeepSeek 案：长列表排序温度0仍有波动（包子
+                # rank0↔rank8 摆动），固定 seed 后 4/4 稳定。
+                "seed": 7,
                 "messages": [
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": USER_PROMPT.format(
@@ -338,6 +345,7 @@ class CloudJudge:
                 "model": self._model,
                 # 同 _call：关思考才秒回（探针 2026-09-07 钉死）
                 "thinking": {"type": "disabled"},
+                "seed": 7,
                 "messages": [
                     {"role": "system", "content": GEN_SYSTEM},
                     {"role": "user", "content": GEN_PROMPT.format(
