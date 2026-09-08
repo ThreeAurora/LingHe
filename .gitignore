@@ -31,3 +31,15 @@ cache/archive/
 # 大文件不入库（GitHub 100MB 上限；语料原始件可由 fetch 脚本再生，lexicon.db 是孤儿产物）
 cache/tmp/subtlex/zh_mono.txt.gz
 dicts/lexicon.db
+
+# 运行时日志（每次打字都在滚，1026 行噪音，无回看价值）
+linghe.log
+
+# cache/tmp 临时区整体不入库：探针脚本、语料原始件（TED2020 等）、
+# librime/octagram/darts-clone 第三方源码包——都是一次性工具，用完即弃
+cache/tmp/
+
+# 训练大文件不入库（GB 级，gen_data.py / preconvert.py 可再生）：
+# gen_v4.jsonl 1.34GB 语料、mm/ 预编码 memmap 数组 1.7GB
+train/data/*.jsonl
+train/data/mm/
