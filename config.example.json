@@ -1,7 +1,7 @@
 {
   "gram": {
     "enabled": true,
-    "model": "E:/AAAAA/wanxiang-lts-zh-hans.gram"
+    "model": "E:/path/to/wanxiang-lts-zh-hans.gram"
   },
   "ai": {
     "enabled": false,
@@ -28,7 +28,7 @@
     "enabled": true,
     "model_dir": "ai_llm/qwen25-05b-hf",
     "api_base": "https://api.deepseek.com",
-    "api_key": "sk-90b8a71fc227488194308b67864767e8",
+    "api_key": "",
     "model": "deepseek-v4.1-flash-expires-on-0910",
     "timeout": 4.0,
     "max_cand": 64

@@ -1,3 +1,6 @@
+# 本地配置（含 API key 等私密信息，不入库；模板见 config.example.json）
+/config.json
+
 # 编译缓存（重跑即回，防丢价值为零）
 __pycache__/
 
