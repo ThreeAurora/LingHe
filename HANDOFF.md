@@ -27,7 +27,7 @@ viterbi/anchor/max_match/char_chains/score_word/_eval_sent/_clean_chain）、
 
 - README 已全面重写至最新进度；`config.json` 已移出版本库（`config.example.json` 为模板）；
 - `cache/tmp/` 等一次性中间产物已从索引清理（`.gitignore` 覆盖，本地文件保留）；
-- LICENSE：MIT（若词库按 GPL 分发需整体换 GPL-3.0）；
+- LICENSE：GPL-3.0（词库按 GPL 分发，整体同许可）；
 - 历史中曾出现的明文 API key 已从索引移除；彻底清除需重写历史（`git filter-repo`）。
 
 ## 4. 关键机制（2026-09-07 ~ 09-09）
