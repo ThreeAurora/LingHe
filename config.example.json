@@ -25,7 +25,7 @@
     "prune_keep": 20
   },
   "judge": {
-    "enabled": true,
+    "enabled": false,
     "model_dir": "ai_llm/qwen25-05b-hf",
     "api_base": "https://api.deepseek.com",
     "api_key": "",

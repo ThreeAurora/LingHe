@@ -2,9 +2,10 @@
 
 外挂模式：免安装、免签名、免驱动。整个文件夹拷到任何位置，`python linghe.py` 即用。
 
-> **当前状态（2026-09-09）**：Windows 可日用 · 码表 19.7 万词条 · 底库 273 万词条 ·
+> **当前状态（2026-09-09）**：仅 Windows · 码表 19.7 万词条 · 底库 273 万词条 ·
 > 端侧统计重排 <5ms · 万象语法搭配查询微秒级 · 可选云端 LLM 终审（DeepSeek，实测
 > 266~616ms）· 端侧神经重排 FastReranker 已训练导出（P@1 86.58%），主引擎待接线。
+> 性能数字为本机热态实测（RTX 2060 / 消费级 CPU），非通用基准。
 
 ## 为什么是外挂而不是安装式
 
@@ -21,9 +22,10 @@
 
 2. **配置**：复制模板 `config.example.json` 为 `config.json`，按需修改。
    - `config.json` 已在 `.gitignore` 中（可能含 API key，不入库）；
-   - 默认 `ai.enabled=false`、`neural.enabled=false`，纯本地静态模式即可日用；
+   - 默认 `ai.enabled=false`、`neural.enabled=false`、`judge.enabled=false`，
+     纯本地静态模式即可日用；
    - 想接云端 LLM 终审：填 `judge.api_base / api_key / model`（默认 DeepSeek，
-     OpenAI 兼容端点均可）；
+     OpenAI 兼容端点均可），并把 `judge.enabled` 改为 `true`；
    - 万象语法模型（可选）：填 `gram.model` 指向本机 `.gram` 文件。
 
 3. 运行（任选其一）：
@@ -48,8 +50,9 @@ python linghe.py --smoke                       -- 自检（码表/钩子/配置�
    - **上屏联想**：每次上屏后自动提示下一个可能的词（豆包式），`空格`直接上屏联想词
      并继续联想成链；敲其他任意键联想消失，不打扰正常组码；
    - `Ctrl+Alt+L`=暂停/恢复外挂；
-   - **无长度上限**：第 5 码起继续当纯双拼音节（不会自动上屏四码），六码可打
-     「詹姆斯」（vjmusi），更长的整句走声母简拼（见下文「简拼」）。
+   - **不会自动上屏四码**：第 5 码起继续当纯双拼音节，六码可打「詹姆斯」
+     （vjmusi），更长的整句走声母简拼（见下文「简拼」）；缓冲区默认最长
+     14 键（`max_buffer_len` 可调）。
 
 ## 智能候选链路
 
@@ -66,7 +69,7 @@ python linghe.py --smoke                       -- 自检（码表/钩子/配置�
 | 层 | 实现 | 状态 |
 |---|---|---|
 | ① 检索召回 | `mabiao.py` / `dict_engine.py` / `rerank.py` | 常开 |
-| ② 万象语法 | `gram_model.py` + `linghe.py` 减价/压顶 | 常开（需自备 `.gram` 模型） |
+| ② 万象语法 | `gram_model.py` + `linghe.py` 减价/压顶 | 需自备 `.gram` 模型，缺失自动跳过 |
 | ③ 统计重排 | `rerank.py` StatReranker | 常开 |
 | ④ 云端终审 | `cloud_judge.py`（DeepSeek） | 配置 key 后启用 |
 | ⑤ 神经重排 | `fast_rerank.py` + `train/ckpt/reranker.onnx` | 模型就绪，待接线 |
@@ -116,7 +119,7 @@ python linghe.py --smoke                       -- 自检（码表/钩子/配置�
 ## 辅助码（手心辅助码）
 
 把 `*辅助*.txt`（如 `简单鹤V9.3.0电脑手心辅助码.txt`）和码表一起放进 `mabiao/`，
-自动加载（实测 9980 行，覆盖 8400 字）。**只用首键**筛选。
+自动加载（实测 9980 行，覆盖 8400 字）。**每个字的辅助码只取首键**筛选。
 
 一个键串会被 `parser.py` 同时按四种确定形态解析，命中即并集输出：
 
@@ -151,13 +154,15 @@ python linghe.py --smoke                       -- 自检（码表/钩子/配置�
 | `spoken_freq.txt` + `spoken_2gram/3gram.txt` | 283486 词 | 口语词频与 2/3gram（口语字链召回） |
 | `cooc_pre.bin` | 词 1990845 / 字 199238 | SIGHAN 预训练共现表（`build_cooc.py` 可复现） |
 
-合计 **2731823 词条**（启动日志实测），双索引：全拼 `zhan mu si`→詹姆斯、
-声母简拼 `u v u`→深圳市。
+合计 **2731823 词条**（启动日志实测，含万象/热词增量），双索引：全拼
+`zhan mu si`→詹姆斯、声母简拼 `u v u`→深圳市。词库文本随仓库分发；二进制
+缓存与 `lexicon.db` 不入库，首次运行自动重建。
 
 **两段式加载**（2026-09-07 起）：先装 20 万高频词 mini 索引（缓存后 2~9s）即可
 打字，全量 273 万词后台热切换（全量缓存加载约 44s，期间输入法已可用）。
-首次文本解析后走 marshal 二进制缓存（`dicts/.cache.bin` / `.cache_mini.bin`，
-按词库文件签名自动失效）。
+之后走 marshal 二进制缓存（`dicts/.cache.bin` / `.cache_mini.bin`，按词库文件
+签名自动失效）；**首次无缓存时需重新解析词库文本**，比缓存加载慢（后台线程，
+期间输入法已可用）。
 
 **自动记忆**：每次上屏都会把「词 + 拼音」写入 `dicts/user_dict.txt`（词频累加），
 下次起该词按使用次数优先出现。新词/网络词打过一次就记住，无需手工加词。
@@ -168,7 +173,7 @@ python linghe.py --smoke                       -- 自检（码表/钩子/配置�
 
 第 5 码起若不是规整双拼，就当**整句声母简拼**处理：每键取一个字的声母
 （zh/ch/sh 记作 v/i/u）。例如 `wilygbz` → 我吃了一个包子。**2 键起就放宽召回**
-（`bz` → 包子，2 键时召回池扩到 90），不再等到打满。
+（`bz` → 包子，2 键也走全池不截断），不再等到打满。
 
 这条路径由四层共同承担（由快到慢）：
 1. **底库简拼索引**：声母串恰是整词的（如 `u v u`→深圳市），亚毫秒即时命中；
@@ -185,8 +190,10 @@ python linghe.py --smoke                       -- 自检（码表/钩子/配置�
 
 ## 云端裁判（DeepSeek）
 
-配置了 `judge.api_key` 时，终审裁判升级为**云端大模型**（默认 DeepSeek，
-OpenAI 兼容端点；2026-09-08 由火山豆包切换而来）：
+`judge.enabled=true` 且配置了 `judge.api_key` 时，终审裁判升级为**云端大模型**
+（默认 DeepSeek，OpenAI 兼容端点；2026-09-08 由火山豆包切换而来）。两者缺一都不会
+走云端：没有 key 时回落本地 Qwen 判别裁判（需自备模型目录），
+`judge.enabled=false` 则整层停用：
 
 - **生成通道**：只给「上文 + 键入码」，云端直接写用户最可能想打的 1~3 个候选
   ——简拼整句首选（`wjtxixhcy → 我今天想吃西湖醋鱼`）只靠生成，不需要这句话
@@ -217,11 +224,11 @@ Qwen2.5-0.5B 判别裁判（模型目录 `judge.model_dir`，不入库，`fetch_
 2026-09-08/09 新训练的判别重排器，训练管线在 `train/`（`gen_data.py` 造语料、
 `eval.py` 评估、`export_onnx.py` 导出）：
 
-- v4 评估（74398 验证样本、候选池 48）：基线 P@1 **46.38%** → 纯重排 **86.58%**，
-  P@3 90.21%，MRR 0.8898；
+- v4 评估（74398 验证样本、候选池 48；线上池为 90，接线时需按 90 池复测）：
+  基线 P@1 **46.38%** → 纯重排 **86.58%**，P@3 90.21%，MRR 0.8898；
 - margin 门控：`tau=1.5` 时 P@1 85.81%、**rank0 误伤 0.477%**（保守门控，
   模型首选与引擎首选分差不够就不换位，不轻易翻掉肌肉记忆）；
-- 模型 11.4MB fp32 ONNX，端侧目标 <30ms，吃「云端裁判到不了」的 0.2s 内本地闭环。
+- 模型 11.4MB fp32 ONNX，端侧目标 <30ms，吃「云端裁判到不了」的击键间本地闭环。
 
 > ⚠️ 当前 `fast_rerank.py` 尚未接入主引擎：`linghe.py` 没有 import、`config.json`
 > 没有 `fast_rank` 段、`models/` 目录也不存在（模型在 `train/ckpt/`）。接线后才
@@ -322,7 +329,7 @@ dicts/              兜底词库（273 万词 + 用户词/共现/口语表）
 | `ai` | `enabled` | `false` | LLM 生成式预测（可选增强，不参与主链路） |
 | `ai` | `local_urls` / `api_base` / `api_key` / `model` | — | 本机 Ollama/LM Studio 或 OpenAI 兼容端点 |
 | `neural` | `enabled` | `false` | RBT3 神经重排（已停用，保留开关） |
-| `judge` | `enabled` / `api_base` / `api_key` / `model` | `true` / DeepSeek / 空 | 云端终审；不填 key 回落本地 Qwen |
+| `judge` | `enabled` / `api_base` / `api_key` / `model` | `false` / DeepSeek / 空 | 云端终审；填 key 后改 `true` 启用，否则回落本地 Qwen 或停用 |
 | `judge` | `timeout` / `max_cand` | `4.0` / `64` | 云端超时与判别名单长度 |
 | 顶层 | `candidate_pool` / `candidate_count` | `90` / `9` | 候选池大小与每页显示数 |
 | 顶层 | `max_buffer_len` | `14` | 最大缓冲码长（支持 14 键整句） |
@@ -330,6 +337,7 @@ dicts/              兜底词库（273 万词 + 用户词/共现/口语表）
 
 ## 已知限制
 
+- **仅 Windows**：依赖 Win32 低级键盘钩子 / Unicode 注入 / UI caret，未做跨平台；
 - 管理员权限窗口里钩子失效（UIPI 限制），需要时以管理员身份运行本程序；
 - 上屏用 Unicode 注入，对极少数 DirectInput 游戏/密码控件无效；
 - 候选窗跟随光标（UI caret），个别自绘光标应用回退到鼠标位置；
@@ -356,6 +364,7 @@ dicts/              兜底词库（273 万词 + 用户词/共现/口语表）
 - 仓库当前**未附 LICENSE**，公开前需先定许可（待办）；
 - 码表（简单鹤 V9.3.0）与词库（雾凇拼音 / 腾讯词库 / SIGHAN 共现）来源各自
   带许可，再分发前需逐一确认；
-- `config.json` 不入库（`.gitignore`），API key 只留本地；
-  模板见 `config.example.json`；
+- `config.json` 不入库（`.gitignore`），API key 只留本地；模板见 `config.example.json`。
+  ⚠️ 历史提交中曾出现过明文 key（现已从索引移除），该 key 必须到服务商控制台
+  **revoke**——删文件不能让它失效。
 - 模型权重（RBT3 / Qwen / `.gram`）均不入库，由脚本或自备再生。
